@@ -89,8 +89,18 @@
   };
   const hideProgress = () => { progressEl.hidden = true; progressBar.style.width = '0'; };
 
-  // CompressionStream API はモダンブラウザでサポート（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
+  // CompressionStream API はモダンブラウザでサポート（gzip: Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
   const compressionSupported = typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
+  // Brotli は gzip より 15〜25% 圧縮率が高いが対応ブラウザが新しい（Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+）。
+  // 圧縮側と展開側で個別判定し、片方だけ対応の環境でも安全に挙動を決められるようにする。
+  const brotliCompressSupported = (() => {
+    if (!compressionSupported) return false;
+    try { new CompressionStream('brotli'); return true; } catch (e) { return false; }
+  })();
+  const brotliDecompressSupported = (() => {
+    if (!compressionSupported) return false;
+    try { new DecompressionStream('brotli'); return true; } catch (e) { return false; }
+  })();
 
   /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
@@ -118,12 +128,17 @@
   });
 
   // ============================================================
-  // gzip 圧縮 / 展開（Copy Short URL 用）
+  // 圧縮 / 展開（Copy Short URL 用）— Brotli 優先、未対応時は gzip にフォールバック
   // ============================================================
-  /** UTF-8 エンコード後のバイト列を gzip + base64url（URL安全）にまとめる。外部送信ゼロ。 */
-  const compressHtml = async (html) => {
+  /**
+   * UTF-8 エンコード後のバイト列を指定形式で圧縮し base64url（URL安全）にまとめる。外部送信ゼロ。
+   * Brotli が使えればそちらを優先する（HTML系で gzip より 15〜25% 短くなる）。
+   * @returns  format: 'brotli' | 'gzip', payload: string 
+   */
+  /** 単一形式で圧縮し base64url 文字列を返す内部関数 */
+  const compressWith = async (html, format) => {
     const enc = new TextEncoder();
-    const stream = new Blob([enc.encode(html)]).stream().pipeThrough(new CompressionStream('gzip'));
+    const stream = new Blob([enc.encode(html)]).stream().pipeThrough(new CompressionStream(format));
     const buf = await new Response(stream).arrayBuffer();
     const bytes = new Uint8Array(buf);
     let binary = '';
@@ -134,15 +149,33 @@
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   };
 
-  /** base64url(gzip) を復号して UTF-8 文字列に戻す */
-  const decompressHtml = async (b64url) => {
+  const compressHtml = async (html) => {
+    // 両対応環境では Brotli と gzip を両方試し、ペイロードが短い方を採用する。
+    // Brotli は固定オーバーヘッドがその分重く、超小HTMLや特殊な内容では gzip の方が短くなるケースをカバーする。
+    // 何らかの理由で一方が例外を投げた場合は黙ってスキップし、もう一方を採用する。
+    const formats = brotliCompressSupported ? ['brotli', 'gzip'] : ['gzip'];
+    const results = [];
+    for (const fmt of formats) {
+      try {
+        results.push({ format: fmt, payload: await compressWith(html, fmt) });
+      } catch (e) {
+        /* この形式はスキップ */
+      }
+    }
+    if (results.length === 0) throw new Error('compression failed for all available formats');
+    // 最短ペイロードを採用（同点は先頭=Brotli を優先）
+    return results.reduce((best, cur) => cur.payload.length < best.payload.length ? cur : best);
+  };
+
+  /** base64url 形式の圧縮ペイロードを復号して UTF-8 文字列に戻す。format は 'brotli' か 'gzip' */
+  const decompressHtml = async (format, b64url) => {
     let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
     const pad = b64.length % 4;
     if (pad) b64 += '='.repeat(4 - pad);
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
     const buf = await new Response(stream).arrayBuffer();
     return new TextDecoder().decode(buf);
   };
@@ -228,18 +261,25 @@
       return;
     }
     let html;
-    // `#z=<base64url>` 接頭辞は gzip+base64url 圧縮されたHTML（Copy Short URL で生成）
-    if (/^z=[A-Za-z0-9_-]+$/.test(raw)) {
-      if (!compressionSupported) {
+    // `#b=<base64url>` は Brotli、`#z=<base64url>` は gzip で圧縮されたHTML（Copy Short URL で生成）
+    const compressedMatch = raw.match(/^([bz])=([A-Za-z0-9_-]+)$/);
+    if (compressedMatch) {
+      const fmt = compressedMatch[1] === 'b' ? 'brotli' : 'gzip';
+      const payload = compressedMatch[2];
+      const supported = compressionSupported && (fmt === 'gzip' || brotliDecompressSupported);
+      if (!supported) {
         if (mySeq !== renderSeq) return;
-        setStatus('compressed payload requires a modern browser (CompressionStream)');
+        const reason = fmt === 'brotli'
+          ? 'this URL uses Brotli; please open in Chrome 144+ / Firefox 147+ / Safari 19+'
+          : 'compressed payload requires a modern browser (CompressionStream)';
+        setStatus(reason);
         frame.srcdoc = renderEmptyState();
         setBusy(false);
         return;
       }
-      setStatus('decompressing...');
+      setStatus('decompressing (' + fmt + ')...');
       try {
-        html = await decompressHtml(raw.slice(2));
+        html = await decompressHtml(fmt, payload);
       } catch (e) {
         if (mySeq !== renderSeq) return;
         setStatus('decompress failed: ' + (e && e.message ? e.message : e));
@@ -986,9 +1026,10 @@
   };
 
   /**
-   * 現在のアーティファクトを gzip+base64url で圧縮し、`#z=...` 形式の短縮URLとしてクリップボードへコピーする。
+   * 現在のアーティファクトを Brotli（未対応時は gzip）で圧縮し、`#b=...` または `#z=...` 形式の
+   * 短縮URLとしてクリップボードへコピーする。Brotli は HTML/CSS/JS で gzip より 15〜25% 短くなる。
    * 外部サービスへの送信は一切行わず、ブラウザ内蔵の CompressionStream API のみ使用する。
-   * 圧縮率は内容に依存するが、典型的には元の30〜50%。SNS に貼れる「本当に短いURL」にはならない点に注意。
+   * 圧縮率は内容に依存するが、典型的には元の25〜45%（Brotli）/ 30〜50%（gzip）。
    */
   const copyShortUrl = async () => {
     if (!currentHtml) {
@@ -1002,8 +1043,9 @@
     setBusy(true);
     setStatus('compressing...');
     try {
-      const compressed = await compressHtml(currentHtml);
-      const shortUrl = location.origin + location.pathname + '#z=' + compressed;
+      const { format, payload } = await compressHtml(currentHtml);
+      const prefix = format === 'brotli' ? '#b=' : '#z=';
+      const shortUrl = location.origin + location.pathname + prefix + payload;
       const originalLen = location.href.length;
       const newLen = shortUrl.length;
       const ratio = originalLen > 0 ? Math.round((newLen / originalLen) * 100) : 0;
@@ -1011,7 +1053,7 @@
       const original = shortenBtn.textContent;
       shortenBtn.textContent = 'Copied';
       setTimeout(() => { shortenBtn.textContent = original; }, 1500);
-      setStatus('Short URL copied (' + formatBytes(originalLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
+      setStatus('Short URL copied (' + format + ', ' + formatBytes(originalLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
     } catch (e) {
       setStatus('shorten failed: ' + (e && e.message ? e.message : e));
     } finally {

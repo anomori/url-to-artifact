@@ -15,7 +15,7 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
     - PDF  — スライド検出時は1スライド=1ページ、単一アーティファクトは縦横比からA4の向きを自動選択し長辺方向にページ分割します（縦長い記事も横長いダッシュボードも対応、jsPDF）
     - PPTX — Marpit形式の `<section>` ベースのスライドは**編集可能なネイティブPPTX**として出力します（見出し・段落・箇条書き・表・画像が個別のPowerPoint要素として配置され、文字編集・検索・読み上げが可能です）。reveal.js / `<hr>` 区切り / 自由構造の場合は画像貼り付けのフォールバックになります（pptxgenjs）
 - Copy URL ボタンで現在URLをクリップボードにコピーできます
-- Copy Short URL ボタンで、現在のアーティファクトを gzip 圧縮した短縮URL（`#z=<base64url>` 形式）としてクリップボードにコピーできます。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API のみで動作します。元URLの30〜50%程度に圧縮されます（SNSに貼れるほど劇的に短くはなりませんが、URL長上限ギリギリのアーティファクトを共有可能サイズに収める用途に有効です）
+- Copy Short URL ボタンで、現在のアーティファクトを圧縮した短縮URLとしてクリップボードにコピーできます。Brotli 対応ブラウザでは Brotli と gzip の両方で圧縮を試行し、ペイロードが短い方を採用します（同点なら Brotli を優先）。出力形式は採用された圧縮で決まり、Brotli は `#b=<base64url>` 形式、gzip は `#z=<base64url>` 形式になります。Brotli 非対応ブラウザでは gzip のみが使われます。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API のみで動作します。圧縮率は内容に依存しますが、Brotli では元URLの25〜45%程度、gzip では30〜50%程度です（HTML/CSS/JS では通常 Brotli が gzip より 15〜25% 短くなりますが、超小HTMLなどでは固定オーバーヘッドの関係で gzip の方が短くなるケースがあるため、両方試して短い方を採用します）
 - `hashchange` イベントに対応しており、URL書き換えで即反映されます（リロード不要）
 - 多スライド・多ページ処理中はツールバーに進捗バーを表示します
 
@@ -113,4 +113,9 @@ iframe の sandbox 属性には以下のトークンを付与しています：
 - CDN が落ちている時は PNG / PDF / PPTX エクスポートが失敗します（HTMLエクスポートはオフラインでも動作します）
 - URL長上限を超える大規模アーティファクトは Gist 連携等の別経路が必要です
 - `navigator.clipboard.writeText` は HTTPS / localhost 上でのみ動作します（GitHub PagesはHTTPSなので問題ありません）
-- Copy Short URL（gzip圧縮）はブラウザ内蔵の `CompressionStream` / `DecompressionStream` API を使用するため、対応ブラウザは Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+ です。古いブラウザではボタンが無効になり、`#z=...` 形式のURLも展開できません。圧縮率は内容に依存しますが、典型的には元の30〜50%です（バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません）。短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません
+- Copy Short URL はブラウザ内蔵の `CompressionStream` / `DecompressionStream` API を使用します。生成側は Brotli 対応環境では Brotli と gzip の両方で圧縮を試行し、出力ペイロードが短い方を採用します（同点なら Brotli を優先）。Brotli 非対応環境では gzip のみが使われます。形式と対応ブラウザは以下のとおりです
+    - Brotli (`#b=...` 形式)：Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+
+    - gzip (`#z=...` 形式)：Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+
+    - 受信側のブラウザが Brotli 非対応で `#b=...` URL を開いた場合は、対応ブラウザで開くよう案内するエラー表示になります
+    - 圧縮率は内容に依存しますが、典型的には元の25〜45%（Brotli）/ 30〜50%（gzip）です。バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません
+    - 短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません
