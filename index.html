@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Artifact Viewer</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font:14px/1.5 system-ui,-apple-system,sans-serif;background:#fafafa;color:#222}
+  body{display:flex;flex-direction:column}
+  #toolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;background:#fff;border-bottom:1px solid #e5e5e5;min-height:44px;flex-shrink:0;flex-wrap:wrap}
+  #toolbar h1{font-size:13px;margin:0;font-weight:600;color:#555;flex:1;min-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #toolbar .status{font-size:11px;color:#888;flex-shrink:0;white-space:nowrap}
+  #toolbar .group{display:flex;border:1px solid #d4d4d4;border-radius:4px;overflow:hidden}
+  #toolbar .group button{border:0;border-right:1px solid #d4d4d4;border-radius:0;background:#f4f4f4}
+  #toolbar .group button:last-child{border-right:0}
+  #toolbar button{font:inherit;font-size:12px;padding:5px 10px;background:#f4f4f4;border:1px solid #d4d4d4;border-radius:4px;cursor:pointer;color:#222}
+  #toolbar button:hover:not(:disabled){background:#e8e8e8}
+  #toolbar button:disabled{opacity:.45;cursor:not-allowed}
+  iframe{flex:1;width:100%;border:0;background:#fff;display:block;min-height:0}
+  body.busy{cursor:progress}
+  body.busy #toolbar button{cursor:progress}
+</style>
+</head>
+<body>
+<header id="toolbar">
+  <h1 id="title">Artifact Viewer</h1>
+  <span class="status" id="status"></span>
+  <div class="group" role="group" aria-label="Export">
+    <button data-export="html" disabled>HTML</button>
+    <button data-export="png" disabled>PNG</button>
+    <button data-export="pdf" disabled>PDF</button>
+    <button data-export="pptx" disabled>PPTX</button>
+  </div>
+  <button id="btn-copy">Copy URL</button>
+</header>
+<iframe id="frame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-same-origin"></iframe>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const frame = $('frame');
+  const titleEl = $('title');
+  const statusEl = $('status');
+  const copyBtn = $('btn-copy');
+  const exportBtns = Array.from(document.querySelectorAll('[data-export]'));
+
+  /** 現在表示中のHTMLソース（エクスポート用に保持） */
+  let currentHtml = '';
+
+  // ============================================================
+  // Utilities
+  // ============================================================
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+
+  const extractTitle = (html) => {
+    const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return m ? m[1].trim() : null;
+  };
+
+  const sanitizeFilename = (name) =>
+    String(name).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim().slice(0, 200) || 'artifact';
+
+  const baseFilename = () => sanitizeFilename(extractTitle(currentHtml) || 'artifact');
+
+  const formatBytes = (n) => {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(2) + ' MB';
+  };
+
+  const setStatus = (msg) => { statusEl.textContent = msg || ''; };
+
+  /** busy=true で全ボタン無効、false で復帰（エクスポート系はアーティファクト未ロード時は無効のまま） */
+  const setBusy = (busy) => {
+    document.body.classList.toggle('busy', !!busy);
+    const hasArtifact = !!currentHtml;
+    exportBtns.forEach(b => { b.disabled = busy || !hasArtifact; });
+    copyBtn.disabled = !!busy;
+  };
+
+  const downloadBlob = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  };
+
+  const canvasToBlob = (canvas, type) => new Promise((res, rej) => {
+    canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob returned null')), type);
+  });
+
+  // ============================================================
+  // Lazy library loader
+  // ============================================================
+  const _loaded = {};
+  const loadScript = (url) => _loaded[url] || (_loaded[url] = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.async = true;
+    s.onload = () => res();
+    s.onerror = () => { delete _loaded[url]; rej(new Error('Failed to load library: ' + url)); };
+    document.head.appendChild(s);
+  }));
+  const URLS = {
+    html2canvas: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+    jspdf:       'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+    pptxgen:     'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js',
+    jszip:       'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'
+  };
+
+  // ============================================================
+  // Renderers (iframe srcdoc 内容)
+  // ============================================================
+  const renderEmptyState = () => {
+    const sample = location.origin + location.pathname + '#<h1>Hello</h1><p>本文</p>';
+    return '<!doctype html><meta charset=utf-8>'
+      + '<style>body{font:14px/1.6 system-ui,-apple-system,sans-serif;padding:2em;max-width:680px;margin:auto;color:#333}'
+      + 'h2{font-size:1.2em;margin-top:0}'
+      + 'code{background:#f4f4f4;padding:.1em .4em;border-radius:3px;font-size:.9em}'
+      + 'pre{background:#f4f4f4;padding:1em;border-radius:6px;overflow:auto;font-size:12px;line-height:1.4;white-space:pre-wrap;word-break:break-all}'
+      + '.note{color:#666;font-size:13px;margin-top:1.5em}</style>'
+      + '<body><h2>Artifact Viewer</h2>'
+      + '<p>このページのURLの <code>#</code> 以降にHTMLを書くと、ここに表示されます。</p>'
+      + '<p>例:</p><pre>' + escapeHtml(sample) + '</pre>'
+      + '<p>ツールバーから HTML / PNG / PDF / PPTX として保存できます。</p>'
+      + '<div class="note"><p><strong>注意点</strong></p><ul>'
+      + '<li>HTML中に <code>#</code> を含める場合のみ <code>%23</code> に置換（その他はブラウザが自動エンコード）</li>'
+      + '<li>URL長は数十KBが実用上限（Chrome 約 32KB / Firefox 64KB / Safari 約 80KB）</li>'
+      + '<li>PNG / PDF / PPTX は外部ライブラリ（html2canvas, jsPDF, pptxgenjs, JSZip）をCDN経由で読み込みます</li>'
+      + '<li>スライド構造を検出した場合 PNGはZIP · PDF/PPTXは多ページとして出力</li>'
+      + '</ul></div></body>';
+  };
+
+  const renderError = (msg) => {
+    return '<!doctype html><meta charset=utf-8>'
+      + '<body style="font:14px/1.6 system-ui,sans-serif;padding:2em;color:#c00">'
+      + '<h2 style="font-size:1.2em">URLのデコードに失敗しました</h2>'
+      + '<pre style="background:#fee;padding:1em;border-radius:6px;color:#600;font-size:12px;white-space:pre-wrap;word-break:break-all">'
+      + escapeHtml(msg) + '</pre>'
+      + '<p style="color:#666;font-size:13px">URL中の <code>%</code> の後ろが正しい 16 進 2 桁になっているか確認してください。</p></body>';
+  };
+
+  /** location.hash からHTMLを取り出してフレームに反映 */
+  const render = () => {
+    const raw = location.hash.slice(1);
+    if (!raw) {
+      currentHtml = '';
+      titleEl.textContent = 'Artifact Viewer';
+      frame.srcdoc = renderEmptyState();
+      setStatus('');
+      setBusy(false);
+      return;
+    }
+    let html;
+    try {
+      html = decodeURIComponent(raw);
+    } catch (e) {
+      currentHtml = '';
+      titleEl.textContent = 'Artifact Viewer';
+      frame.srcdoc = renderError(String(e && e.message ? e.message : e));
+      setStatus('decode failed');
+      setBusy(false);
+      return;
+    }
+    currentHtml = html;
+    titleEl.textContent = extractTitle(html) || 'Artifact';
+    frame.srcdoc = html;
+    setStatus(formatBytes(html.length));
+    setBusy(false);
+  };
+
+  // ============================================================
+  // Capture (iframe -> Canvas[])
+  // ============================================================
+  /** iframe ロード完了待ち（最大1.5秒のフォールバック） */
+  const waitForFrame = () => new Promise((res) => {
+    const ready = frame.contentDocument && frame.contentDocument.readyState === 'complete';
+    if (ready) { res(); return; }
+    let done = false;
+    frame.addEventListener('load', () => { if (!done) { done = true; res(); } }, { once: true });
+    setTimeout(() => { if (!done) { done = true; res(); } }, 1500);
+  });
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const next2Frames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  /** documentElement を html2canvas で撮影 */
+  const snapshot = (doc, ww, hh) => window.html2canvas(doc.documentElement, {
+    backgroundColor: '#ffffff',
+    scale: 2,
+    useCORS: true,
+    logging: false,
+    windowWidth: ww || doc.documentElement.scrollWidth,
+    windowHeight: hh || doc.documentElement.scrollHeight
+  });
+
+  /** PNG用：現在のビュー1枚だけ */
+  const captureSingle = async () => {
+    await loadScript(URLS.html2canvas);
+    await waitForFrame();
+    const doc = frame.contentDocument;
+    if (!doc || !doc.documentElement) {
+      throw new Error('iframe document is unavailable (sandbox may be too strict)');
+    }
+    return snapshot(doc);
+  };
+
+  /**
+   * スライド構造を自動検出して順番に撮影。
+   *   reveal.js   : Reveal.slide(h,v,f) で全スライドを巡回（transition: none）
+   *   汎用<section>: body / main / .slides 直下の <section>・.slide を display 切替で巡回
+   *   フォールバック : 全体1枚
+   * 戻り値: { canvases: HTMLCanvasElement[], mode: 'reveal'|'sections'|'single' }
+   */
+  const captureSlides = async () => {
+    await loadScript(URLS.html2canvas);
+    await waitForFrame();
+    const doc = frame.contentDocument;
+    const win = frame.contentWindow;
+    if (!doc || !doc.documentElement) {
+      throw new Error('iframe document is unavailable (sandbox may be too strict)');
+    }
+
+    // ---- reveal.js path ----
+    const Reveal = win && win.Reveal;
+    const hasReveal = Reveal
+      && typeof Reveal.slide === 'function'
+      && typeof Reveal.getSlides === 'function'
+      && typeof Reveal.getIndices === 'function';
+    if (hasReveal) {
+      let slides = [];
+      try { slides = Reveal.getSlides() || []; } catch (e) { slides = []; }
+      if (slides.length > 1) {
+        let origIdx = null;
+        try { origIdx = Reveal.getIndices(); } catch (e) {}
+        try { Reveal.configure({ transition: 'none', backgroundTransition: 'none', controls: false, progress: false }); } catch (e) {}
+        const ww = frame.clientWidth || doc.documentElement.scrollWidth;
+        const hh = frame.clientHeight || doc.documentElement.scrollHeight;
+        const canvases = [];
+        try {
+          for (let i = 0; i < slides.length; i++) {
+            let idx = { h: i, v: 0 };
+            try { idx = Reveal.getIndices(slides[i]) || idx; } catch (e) {}
+            try { Reveal.slide(idx.h || 0, idx.v || 0, idx.f); } catch (e) {}
+            await sleep(150);
+            await next2Frames();
+            setStatus('exporting slide ' + (i + 1) + '/' + slides.length + '...');
+            canvases.push(await snapshot(doc, ww, hh));
+          }
+        } finally {
+          if (origIdx) {
+            try { Reveal.slide(origIdx.h || 0, origIdx.v || 0, origIdx.f); } catch (e) {}
+          }
+        }
+        return { canvases, mode: 'reveal' };
+      }
+    }
+
+    // ---- 汎用セクション分割 ----
+    const selectors = [
+      'body > section',
+      'body > .slide',
+      'body > div.slide',
+      'main > section',
+      'main > .slide',
+      '.slides > section'
+    ];
+    let sections = null;
+    for (const sel of selectors) {
+      const found = Array.from(doc.querySelectorAll(sel));
+      if (found.length > 1) { sections = found; break; }
+    }
+    if (sections) {
+      const original = sections.map(s => s.style.display);
+      const ww = doc.documentElement.scrollWidth;
+      const canvases = [];
+      try {
+        for (let i = 0; i < sections.length; i++) {
+          sections.forEach((s, j) => { s.style.display = (i === j) ? '' : 'none'; });
+          await next2Frames();
+          setStatus('exporting slide ' + (i + 1) + '/' + sections.length + '...');
+          const visibleH = sections[i].scrollHeight || doc.documentElement.scrollHeight;
+          canvases.push(await snapshot(doc, ww, visibleH));
+        }
+      } finally {
+        sections.forEach((s, j) => { s.style.display = original[j]; });
+      }
+      return { canvases, mode: 'sections' };
+    }
+
+    // ---- フォールバック：全体1枚 ----
+    return { canvases: [await snapshot(doc)], mode: 'single' };
+  };
+
+  // ============================================================
+  // Exporters
+  // ============================================================
+  const exporters = {
+    html: async () => {
+      const blob = new Blob([currentHtml], { type: 'text/html;charset=utf-8' });
+      downloadBlob(blob, baseFilename() + '.html');
+      setStatus('HTML saved');
+    },
+
+    png: async () => {
+      setStatus('exporting PNG...');
+      const { canvases, mode } = await captureSlides();
+      // 単一 → 1枚のPNG、複数 → ZIPアーカイブ
+      if (canvases.length === 1) {
+        const blob = await canvasToBlob(canvases[0], 'image/png');
+        downloadBlob(blob, baseFilename() + '.png');
+        setStatus('PNG saved (' + formatBytes(blob.size) + ', mode=' + mode + ')');
+        return;
+      }
+      await loadScript(URLS.jszip);
+      const zip = new window.JSZip();
+      const padLen = String(canvases.length).length;
+      for (let i = 0; i < canvases.length; i++) {
+        setStatus('packing PNG ' + (i + 1) + '/' + canvases.length + '...');
+        const blob = await canvasToBlob(canvases[i], 'image/png');
+        const idx = String(i + 1).padStart(padLen, '0');
+        zip.file(baseFilename() + '-' + idx + '.png', blob);
+      }
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      downloadBlob(zipBlob, baseFilename() + '-png.zip');
+      setStatus('PNG ZIP saved (' + canvases.length + ' images, ' + formatBytes(zipBlob.size) + ', mode=' + mode + ')');
+    },
+
+    pdf: async () => {
+      setStatus('exporting PDF...');
+      await loadScript(URLS.jspdf);
+      const { canvases, mode } = await captureSlides();
+      const { jsPDF } = window.jspdf;
+
+      // 単一モード（プレゼンではない通常のアーティファクト）
+      // → 縦長いときは A4縦にページ自動分割、フィットするときは従来通り 1ページ
+      if (mode === 'single' && canvases.length === 1) {
+        const c = canvases[0];
+        const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4', compress: true });
+        const pw = pdf.internal.pageSize.getWidth();
+        const ph = pdf.internal.pageSize.getHeight();
+        const scale = pw / c.width;            // canvasピクセル×scale = PDFポイント
+        const scaledH = c.height * scale;       // 全体をページ幅に合わせたときの高さ
+        if (scaledH <= ph) {
+          // 1ページに収まる → 従来のレターボックス
+          const r = Math.min(pw / c.width, ph / c.height);
+          const w = c.width * r;
+          const h = c.height * r;
+          pdf.addImage(c.toDataURL('image/png'), 'PNG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+          pdf.save(baseFilename() + '.pdf');
+          setStatus('PDF saved (1 page, mode=single)');
+        } else {
+          // 縦に長い → 1ページごとにキャンバスをスライス
+          const pageHInCanvas = ph / scale;     // 1ページ分の元キャンバス高さ
+          const pageCount = Math.ceil(c.height / pageHInCanvas);
+          const slicer = document.createElement('canvas');
+          slicer.width = c.width;
+          const sctx = slicer.getContext('2d');
+          for (let i = 0; i < pageCount; i++) {
+            const sy = i * pageHInCanvas;
+            const sliceH = Math.min(pageHInCanvas, c.height - sy);
+            slicer.height = Math.ceil(sliceH);
+            sctx.fillStyle = '#ffffff';
+            sctx.fillRect(0, 0, slicer.width, slicer.height);
+            sctx.drawImage(c, 0, sy, c.width, sliceH, 0, 0, c.width, sliceH);
+            if (i > 0) pdf.addPage('a4', 'portrait');
+            pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, pw, sliceH * scale, undefined, 'FAST');
+            setStatus('rendering PDF page ' + (i + 1) + '/' + pageCount + '...');
+          }
+          pdf.save(baseFilename() + '.pdf');
+          setStatus('PDF saved (' + pageCount + ' pages, mode=long-page)');
+        }
+        return;
+      }
+
+      // 複数スライド：1スライド = 1ページ（向きはキャンバス比で個別判定）
+      const first = canvases[0];
+      const firstOrient = first.width >= first.height ? 'landscape' : 'portrait';
+      const pdf = new jsPDF({ orientation: firstOrient, unit: 'pt', format: 'a4', compress: true });
+      for (let i = 0; i < canvases.length; i++) {
+        const c = canvases[i];
+        const orient = c.width >= c.height ? 'landscape' : 'portrait';
+        if (i > 0) pdf.addPage('a4', orient);
+        const pw = pdf.internal.pageSize.getWidth();
+        const ph = pdf.internal.pageSize.getHeight();
+        const r = Math.min(pw / c.width, ph / c.height);
+        const w = c.width * r;
+        const h = c.height * r;
+        pdf.addImage(c.toDataURL('image/png'), 'PNG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+      }
+      pdf.save(baseFilename() + '.pdf');
+      setStatus('PDF saved (' + canvases.length + ' page' + (canvases.length === 1 ? '' : 's') + ', mode=' + mode + ')');
+    },
+
+    pptx: async () => {
+      setStatus('exporting PPTX...');
+      await loadScript(URLS.pptxgen);
+      const { canvases, mode } = await captureSlides();
+      const PptxGenJS = window.PptxGenJS;
+      const pptx = new PptxGenJS();
+      pptx.layout = 'LAYOUT_WIDE'; // 13.333 x 7.5 inches (16:9)
+      const slideW = 13.333, slideH = 7.5;
+      const slideRatio = slideW / slideH;
+      for (const canvas of canvases) {
+        const imgRatio = canvas.width / canvas.height;
+        let w, h;
+        if (imgRatio > slideRatio) { w = slideW; h = slideW / imgRatio; }
+        else { h = slideH; w = slideH * imgRatio; }
+        const s = pptx.addSlide();
+        s.addImage({
+          data: canvas.toDataURL('image/png'),
+          x: (slideW - w) / 2,
+          y: (slideH - h) / 2,
+          w, h
+        });
+      }
+      const ttl = extractTitle(currentHtml);
+      if (ttl) pptx.title = ttl;
+      await pptx.writeFile({ fileName: baseFilename() + '.pptx' });
+      setStatus('PPTX saved (' + canvases.length + ' slide' + (canvases.length === 1 ? '' : 's') + ', mode=' + mode + ')');
+    }
+  };
+
+  // ============================================================
+  // Copy URL
+  // ============================================================
+  const copyUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(location.href);
+      const original = copyBtn.textContent;
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => { copyBtn.textContent = original; }, 1500);
+    } catch (e) {
+      setStatus('copy failed: ' + (e && e.message ? e.message : e));
+    }
+  };
+
+  // ============================================================
+  // Events
+  // ============================================================
+  window.addEventListener('hashchange', render);
+
+  exportBtns.forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const fmt = btn.dataset.export;
+      if (!exporters[fmt] || !currentHtml) return;
+      setBusy(true);
+      try {
+        await exporters[fmt]();
+      } catch (e) {
+        setStatus(fmt.toUpperCase() + ' export failed: ' + (e && e.message ? e.message : e));
+      } finally {
+        setBusy(false);
+      }
+    });
+  });
+
+  copyBtn.addEventListener('click', copyUrl);
+
+  // === Initial render ===
+  render();
+})();
+</script>
+</body>
+</html>
