@@ -4,6 +4,8 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
 
 **公開URL**: <https://anomori.github.io/url-to-artifact/>
 
+**動作デモ**: [Hello World](https://anomori.github.io/url-to-artifact/#%3Ch1%3EHello%3C/h1%3E%3Cp%3E%E6%9C%AC%E6%96%87%3C/p%3E)
+
 ## 何ができるか
 
 - URL の `#` 以降にHTMLを書くと、その場でレンダリング
@@ -18,9 +20,9 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
 
 ## 使い方
 
-ホスティング先の `index.html` のURLの末尾に `#` と表示したいHTML本体を追加するだけ。例：
+公開URL の末尾に `#` と表示したいHTML本体を追加するだけ。例：
 
-    https://<host>/index.html#<h1>Hello</h1><p>本文</p>
+    https://anomori.github.io/url-to-artifact/#<h1>Hello</h1><p>本文</p>
 
 ブラウザが特殊文字を自動でURLエンコードするため、手動でエンコードする必要はない。ただし `#` をHTML中に含めたい場合のみ `%23` に置換すること。
 
@@ -83,9 +85,3 @@ iframe の sandbox 属性は 以下のトークンを付与している：
 - CDN が落ちている時は PNG / PDF / PPTX エクスポートが失敗する（HTMLエクスポートはオフラインでも動作）
 - URL長上限を超える大規模アーティファクトは Gist 連携等の別経路が必要
 - `navigator.clipboard.writeText` は HTTPS / localhost 上でのみ動作する（GitHub PagesはHTTPSなので問題なし）
-
-## ファイル構成
-
-    /
-    ├─ index.html   メインのビューア本体
-    └─ README.md   このドキュメント
