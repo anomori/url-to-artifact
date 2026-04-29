@@ -181,6 +181,7 @@
     if (!raw) {
       currentHtml = '';
       titleEl.textContent = 'Artifact Viewer';
+      document.title = 'Artifact Viewer';
       frame.srcdoc = renderEmptyState();
       setStatus('');
       setBusy(false);
@@ -188,7 +189,10 @@
     }
     const html = decodeHashHtml(raw);
     currentHtml = html;
-    titleEl.textContent = extractTitle(html) || 'Artifact';
+    const ttl = extractTitle(html) || 'Artifact';
+    titleEl.textContent = ttl;
+    // ブラウザタブにも反映（複数タブで区別しやすくする）
+    document.title = ttl + ' — Artifact Viewer';
     frame.srcdoc = html;
     setStatus(formatBytes(html.length));
     setBusy(false);
@@ -258,7 +262,20 @@
       try { slides = Reveal.getSlides() || []; } catch (e) { slides = []; }
       if (slides.length > 1) {
         let origIdx = null;
+        let origCfg = null;
         try { origIdx = Reveal.getIndices(); } catch (e) {}
+        // 元の configure 値を保存して、export後に復元する（transitionを永遠にnoneにしたままにしない）
+        try {
+          if (typeof Reveal.getConfig === 'function') {
+            const cfg = Reveal.getConfig() || {};
+            origCfg = {
+              transition: cfg.transition,
+              backgroundTransition: cfg.backgroundTransition,
+              controls: cfg.controls,
+              progress: cfg.progress
+            };
+          }
+        } catch (e) {}
         try { Reveal.configure({ transition: 'none', backgroundTransition: 'none', controls: false, progress: false }); } catch (e) {}
         const ww = frame.clientWidth || doc.documentElement.scrollWidth;
         const hh = frame.clientHeight || doc.documentElement.scrollHeight;
@@ -275,6 +292,9 @@
             canvases.push(await snapshot(doc, ww, hh));
           }
         } finally {
+          if (origCfg) {
+            try { Reveal.configure(origCfg); } catch (e) {}
+          }
           if (origIdx) {
             try { Reveal.slide(origIdx.h || 0, origIdx.v || 0, origIdx.f); } catch (e) {}
           }
@@ -320,7 +340,8 @@
     // ---- <hr> 区切りスライド (Markdown→HTML 直変換などで body 直下に <hr> が並ぶケース) ----
     const allHrs = Array.from(doc.querySelectorAll('body > hr'));
     if (allHrs.length >= 2) {
-      const allEls = Array.from(doc.body.children).filter(el => el.tagName !== 'SCRIPT' && el.tagName !== 'STYLE');
+      const SKIP_TAGS = ['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','LINK','META','TITLE','BASE'];
+      const allEls = Array.from(doc.body.children).filter(el => SKIP_TAGS.indexOf(el.tagName) < 0);
       const groups = [];
       let current = [];
       for (const el of allEls) {
@@ -355,6 +376,316 @@
 
     // ---- フォールバック：全体1枚 ----
     return { canvases: [await snapshot(doc)], mode: 'single' };
+  };
+
+  // ============================================================
+  // Editable PPTX (Marpit) — extracts native PPTX text/image/table from DOM
+  // ============================================================
+
+  /** rgb()/rgba()文字列を 'RRGGBB' に変換。透明はnull */
+  const cssColorToHex = (color) => {
+    if (!color) return null;
+    const m = String(color).match(/^rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*([\d.]+))?\)$/);
+    if (!m) return null;
+    const a = m[4] === undefined ? 1 : parseFloat(m[4]);
+    if (a < 0.05) return null;
+    const toHex = (v) => Math.round(parseFloat(v)).toString(16).padStart(2, '0');
+    return (toHex(m[1]) + toHex(m[2]) + toHex(m[3])).toUpperCase();
+  };
+
+  /** font-family の最初のフォント名だけ取り出す（クォートを剥がす） */
+  const fontFamilyFirst = (ff) => {
+    if (!ff) return undefined;
+    const first = String(ff).split(',')[0].replace(/['"]/g, '').trim();
+    return first || undefined;
+  };
+
+  /** DOM要素配下のテキストを書式付きランの配列として抽出（pptxgenjs addText形式） */
+  const extractRunsFromElement = (root, win) => {
+    const runs = [];
+    const walk = (node, ctx) => {
+      if (node.nodeType === 3) {
+        const t = node.textContent;
+        if (t && t.length > 0) runs.push({ text: t, options: Object.assign({}, ctx) });
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const tag = node.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
+      if (tag === 'BR') {
+        runs.push({ text: '', options: Object.assign({}, ctx, { breakLine: true }) });
+        return;
+      }
+      const cs = win.getComputedStyle(node);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return;
+      const newCtx = Object.assign({}, ctx);
+      const fw = parseInt(cs.fontWeight, 10);
+      if ((!isNaN(fw) && fw >= 600) || tag === 'STRONG' || tag === 'B') newCtx.bold = true;
+      if (cs.fontStyle === 'italic' || tag === 'EM' || tag === 'I') newCtx.italic = true;
+      const td = (cs.textDecorationLine || cs.textDecoration || '');
+      if (td.indexOf('underline') >= 0 || tag === 'U') newCtx.underline = { style: 'sng' };
+      if (td.indexOf('line-through') >= 0 || tag === 'S' || tag === 'STRIKE' || tag === 'DEL') newCtx.strike = 'sngStrike';
+      const c = cssColorToHex(cs.color);
+      if (c) newCtx.color = c;
+      if (tag === 'CODE' || tag === 'KBD' || tag === 'SAMP' || tag === 'TT') newCtx.fontFace = 'Consolas';
+      if (tag === 'A') {
+        // SVGの<a>は node.href が SVGAnimatedString になるため getAttribute を使う
+        const href = node.getAttribute && node.getAttribute('href');
+        if (href) {
+          const url = (typeof node.href === 'string' && node.href) || href;
+          // PowerPointで開いた際の安全性のため javascript: / data: / vbscript: スキームは除外
+          if (!/^\s*(javascript|data|vbscript):/i.test(url)) {
+            newCtx.hyperlink = { url };
+          }
+        }
+      }
+      Array.from(node.childNodes).forEach((ch) => walk(ch, newCtx));
+    };
+    walk(root, {});
+    return runs;
+  };
+
+  /** <img>を可能ならdataURL化（同一オリジン or 既にdataURLの場合のみ成功） */
+  const imgToDataURL = (img, doc) => {
+    if (!img.src) return null;
+    if (img.src.startsWith('data:')) return img.src;
+    try {
+      const c = doc.createElement('canvas');
+      c.width = img.naturalWidth || img.width || 1;
+      c.height = img.naturalHeight || img.height || 1;
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL('image/png');
+    } catch (e) {
+      return null;
+    }
+  };
+
+  /**
+   * Marpit形式の<section>群から、編集可能なネイティブPPTXを構築する。
+   * 各<section>を1スライドに割り当て、配下の見出し・段落・リスト・表・画像・hrを
+   * getBoundingClientRectで実測した位置・サイズでネイティブPPTX要素として配置する。
+   * 文字色・背景色・フォントサイズ・太字・斜体・下線・取り消し線・リンクを反映。
+   */
+  const buildEditablePptx = async (pptx, sections, doc, win) => {
+    const slideW = 13.333, slideH = 7.5;
+    const HANDLED = ['H1','H2','H3','H4','H5','H6','P','UL','OL','BLOCKQUOTE','PRE','TABLE','IMG','HR','FIGCAPTION'];
+    const clampPt = (v) => Math.max(6, Math.min(96, v));
+
+    // 画像のロード完了を最大 3 秒待つ（dataURL化に naturalWidth>0 が必要）
+    const allImgs = [];
+    sections.forEach(s => Array.from(s.querySelectorAll('img')).forEach(img => allImgs.push(img)));
+    if (allImgs.length > 0) {
+      await Promise.all(allImgs.map(img => {
+        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+        return new Promise(res => {
+          let done = false;
+          const finish = () => { if (!done) { done = true; res(); } };
+          img.addEventListener('load', finish, { once: true });
+          img.addEventListener('error', finish, { once: true });
+          setTimeout(finish, 3000);
+        });
+      }));
+    }
+
+    // Marpitなどがビューポートにフィットさせるために transform: scale() を使うと、
+    // getBoundingClientRect は縮小後の値を返す一方で font-size の px 値は変わらず、
+    // 計算した fontPt が過大になる。計測中は一時的に transform を解除する。
+    const transformedEls = [];
+    const savedTransforms = [];
+    sections.forEach(s => {
+      let el = s;
+      while (el && el !== doc.documentElement) {
+        if (win.getComputedStyle(el).transform !== 'none' && transformedEls.indexOf(el) < 0) {
+          transformedEls.push(el);
+          savedTransforms.push(el.style.transform);
+        }
+        el = el.parentElement;
+      }
+    });
+    transformedEls.forEach(el => el.style.setProperty('transform', 'none', 'important'));
+
+    const collectLeaves = (root) => {
+      const leaves = [];
+      const visit = (el) => {
+        if (!el || el.nodeType !== 1) return;
+        const cs = win.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return;
+        const tag = el.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
+        if (HANDLED.indexOf(tag) >= 0) {
+          leaves.push(el);
+          // 段落・見出し等の中に <img> がある場合は、IMG も独立 leaf として追加し、
+          // ネイティブ画像として配置する（p の runs が空なら addText はスキップされる）
+          if (tag !== 'IMG' && tag !== 'TABLE' && tag !== 'PRE') {
+            Array.from(el.querySelectorAll('img')).forEach((img) => {
+              const imgCs = win.getComputedStyle(img);
+              if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden') leaves.push(img);
+            });
+          }
+          return;
+        }
+        Array.from(el.children).forEach(visit);
+      };
+      Array.from(root.children).forEach(visit);
+      return leaves;
+    };
+
+    const original = sections.map(s => s.style.display);
+    try {
+      for (let i = 0; i < sections.length; i++) {
+        sections.forEach((s, j) => { s.style.display = (i === j) ? '' : 'none'; });
+        await next2Frames();
+        showProgress(i + 1, sections.length);
+        setStatus('building slide ' + (i + 1) + '/' + sections.length + '...');
+
+        const section = sections[i];
+        const secRect = section.getBoundingClientRect();
+        // 空・極小 section はスライドを作らずにスキップ（空白スライドと、fontScaleが爆発的に大きくなる事態を防止）
+        if (secRect.width < 10 || secRect.height < 10) continue;
+        const slide = pptx.addSlide();
+
+        const secStyle = win.getComputedStyle(section);
+        const secBg = cssColorToHex(secStyle.backgroundColor);
+        if (secBg) slide.background = { color: secBg };
+
+        const scaleX = slideW / secRect.width;
+        const scaleY = slideH / secRect.height;
+        const fontScale = scaleY;
+
+        const leaves = collectLeaves(section);
+        for (const el of leaves) {
+          const r = el.getBoundingClientRect();
+          const x = (r.left - secRect.left) * scaleX;
+          const y = (r.top - secRect.top) * scaleY;
+          const w = r.width * scaleX;
+          const h = r.height * scaleY;
+          if (w <= 0.01 || h <= 0.01) continue;
+
+          const tag = el.tagName;
+          const cs = win.getComputedStyle(el);
+          const fontSizePx = parseFloat(cs.fontSize) || 16;
+          const fontPt = clampPt(fontSizePx * fontScale * 72);
+          const color = cssColorToHex(cs.color);
+          const bgcolor = cssColorToHex(cs.backgroundColor);
+          const fontFace = fontFamilyFirst(cs.fontFamily);
+          const fwn = parseInt(cs.fontWeight, 10);
+          const isBold = (!isNaN(fwn) && fwn >= 600) || tag === 'STRONG' || tag === 'B';
+          const isItalic = cs.fontStyle === 'italic';
+          const ta = cs.textAlign;
+          const align = (ta === 'center') ? 'center'
+            : (ta === 'right' || ta === 'end') ? 'right'
+            : (ta === 'justify') ? 'justify'
+            : 'left';
+
+          if (tag === 'IMG') {
+            const data = imgToDataURL(el, doc);
+            if (data) slide.addImage({ data, x, y, w, h });
+            continue;
+          }
+          if (tag === 'HR') {
+            const lineColor = color || cssColorToHex(cs.borderTopColor) || '888888';
+            slide.addShape('rect', {
+              x, y: y + h/2 - 0.01, w, h: 0.02,
+              fill: { color: lineColor },
+              line: { color: lineColor, width: 0 }
+            });
+            continue;
+          }
+          if (tag === 'TABLE') {
+            const rows = Array.from(el.querySelectorAll('tr')).map((tr) =>
+              Array.from(tr.children).filter(cc => cc.tagName === 'TH' || cc.tagName === 'TD').map((td) => {
+                const tdcs = win.getComputedStyle(td);
+                const tdfill = cssColorToHex(tdcs.backgroundColor);
+                const tdcolor = cssColorToHex(tdcs.color);
+                const tdfsize = parseFloat(tdcs.fontSize) || fontSizePx;
+                const cellRuns = extractRunsFromElement(td, win);
+                return {
+                  // 空セルはスペース1つをプレースホルダーとして返す（pptxgenjsの表セルに text: [] を渡すと不安定）
+                  text: cellRuns.length > 0 ? cellRuns : [{ text: ' ', options: {} }],
+                  options: {
+                    fill: tdfill ? { color: tdfill } : undefined,
+                    color: tdcolor || undefined,
+                    bold: td.tagName === 'TH' ? true : undefined,
+                    fontSize: clampPt(tdfsize * fontScale * 72),
+                    fontFace,
+                    colspan: parseInt(td.getAttribute('colspan'), 10) > 1 ? parseInt(td.getAttribute('colspan'), 10) : undefined,
+                    rowspan: parseInt(td.getAttribute('rowspan'), 10) > 1 ? parseInt(td.getAttribute('rowspan'), 10) : undefined
+                  }
+                };
+              })
+            ).filter(r => r.length > 0);
+            if (rows.length > 0) {
+              slide.addTable(rows, { x, y, w, h, fontSize: fontPt, fontFace, color: color || undefined });
+            }
+            continue;
+          }
+          if (tag === 'UL' || tag === 'OL') {
+            const items = Array.from(el.children).filter((cc) => cc.tagName === 'LI');
+            if (items.length === 0) continue;
+            const arr = [];
+            items.forEach((li, idx) => {
+              const liRuns = extractRunsFromElement(li, win);
+              if (liRuns.length === 0) liRuns.push({ text: ' ', options: {} });
+              for (let k = 0; k < liRuns.length; k++) {
+                if (k === liRuns.length - 1 && idx < items.length - 1) {
+                  liRuns[k].options = Object.assign({}, liRuns[k].options, { breakLine: true });
+                }
+                arr.push(liRuns[k]);
+              }
+            });
+            slide.addText(arr, {
+              x, y, w, h,
+              fontSize: fontPt,
+              color: color || undefined,
+              bold: isBold || undefined,
+              italic: isItalic || undefined,
+              fontFace,
+              align,
+              valign: 'top',
+              bullet: tag === 'OL' ? { type: 'number' } : true,
+              fill: bgcolor ? { color: bgcolor } : undefined,
+              paraSpaceAfter: 4
+            });
+            continue;
+          }
+          if (tag === 'PRE') {
+            const text = el.textContent || '';
+            slide.addText(text, {
+              x, y, w, h,
+              fontSize: clampPt(fontPt * 0.9),
+              color: color || undefined,
+              fontFace: 'Consolas',
+              align: 'left',
+              valign: 'top',
+              fill: { color: bgcolor || 'F4F4F4' },
+              isTextBox: true
+            });
+            continue;
+          }
+          // h1-h6, p, blockquote, figcaption
+          const runs = extractRunsFromElement(el, win);
+          if (runs.length === 0) continue;
+          slide.addText(runs, {
+            x, y, w, h,
+            fontSize: fontPt,
+            color: color || undefined,
+            bold: isBold || undefined,
+            italic: isItalic || undefined,
+            fontFace,
+            align,
+            valign: 'top',
+            fill: bgcolor ? { color: bgcolor } : undefined
+          });
+        }
+      }
+    } finally {
+      sections.forEach((s, j) => { s.style.display = original[j]; });
+      transformedEls.forEach((el, idx) => {
+        const v = savedTransforms[idx];
+        if (v) el.style.transform = v;
+        else el.style.removeProperty('transform');
+      });
+    }
   };
 
   // ============================================================
@@ -479,10 +810,39 @@
     pptx: async () => {
       setStatus('exporting PPTX...');
       await loadScript(URLS.pptxgen);
-      const { canvases, mode } = await captureSlides();
+      await waitForFrame();
+      const doc = frame.contentDocument;
+      const win = frame.contentWindow;
+      if (!doc || !doc.documentElement) {
+        throw new Error('iframe document is unavailable (sandbox may be too strict)');
+      }
       const PptxGenJS = window.PptxGenJS;
       const pptx = new PptxGenJS();
       pptx.layout = 'LAYOUT_WIDE'; // 13.333 x 7.5 inches (16:9)
+
+      // 編集可能パスの判定: reveal.jsでなく、複数の<section>がbody直下/.marpit直下/main直下にあるか
+      const hasReveal = win.Reveal && typeof win.Reveal.slide === 'function';
+      let editableSections = null;
+      if (!hasReveal) {
+        for (const sel of ['body > section', '.marpit > section', 'main > section']) {
+          const found = Array.from(doc.querySelectorAll(sel));
+          if (found.length >= 2) { editableSections = found; break; }
+        }
+      }
+
+      if (editableSections) {
+        // Marpit構造 → ネイティブ要素ベースの編集可能PPTX
+        setStatus('building editable PPTX (' + editableSections.length + ' slides)...');
+        await buildEditablePptx(pptx, editableSections, doc, win);
+        const ttl = extractTitle(currentHtml);
+        if (ttl) pptx.title = ttl;
+        await pptx.writeFile({ fileName: baseFilename() + '.pptx' });
+        setStatus('PPTX saved (' + editableSections.length + ' slides, mode=editable)');
+        return;
+      }
+
+      // フォールバック: 画像貼り付け（reveal.js / hr区切り / 自由構造）
+      const { canvases, mode } = await captureSlides();
       const slideW = 13.333, slideH = 7.5;
       const slideRatio = slideW / slideH;
       for (const canvas of canvases) {
@@ -501,7 +861,7 @@
       const ttl = extractTitle(currentHtml);
       if (ttl) pptx.title = ttl;
       await pptx.writeFile({ fileName: baseFilename() + '.pptx' });
-      setStatus('PPTX saved (' + canvases.length + ' slide' + (canvases.length === 1 ? '' : 's') + ', mode=' + mode + ')');
+      setStatus('PPTX saved (' + canvases.length + ' slide' + (canvases.length === 1 ? '' : 's') + ', mode=image-' + mode + ')');
     }
   };
 
