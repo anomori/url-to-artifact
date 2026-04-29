@@ -1014,9 +1014,23 @@
   // ============================================================
   // Copy URL / Copy Short URL
   // ============================================================
+  /**
+   * Copy URL ボタン。圧縮URL（`#b=...` / `#z=...`）で開いている場合は、
+   * 展開後の生HTMLを # 以降にそのまま埋めた「非圧縮の元URL」を組み立ててコピーする。
+   * 生HTMLでそのまま開いている場合は location.href をそのままコピーする（従来挙動）。
+   */
   const copyUrl = async () => {
     try {
-      await navigator.clipboard.writeText(location.href);
+      let url = location.href;
+      const raw = location.hash.slice(1);
+      const isCompressed = /^([bz])=[A-Za-z0-9_-]+$/.test(raw);
+      if (isCompressed && currentHtml) {
+        // AGENTS のルールに従い、HTML 中の `#` のみ %23 にエスケープする。
+        // その他の特殊文字（< > " 等）はブラウザがアドレスバー表示上で自動エンコードし、
+        // ビューア側は decodeHashHtml で復元するため、生HTML のまま埋めて良い。
+        url = location.origin + location.pathname + '#' + currentHtml.replace(/#/g, '%23');
+      }
+      await navigator.clipboard.writeText(url);
       const original = copyBtn.textContent;
       copyBtn.textContent = 'Copied';
       setTimeout(() => { copyBtn.textContent = original; }, 1500);
