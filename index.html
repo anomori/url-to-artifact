@@ -153,13 +153,26 @@
       + '</ul></div></body>';
   };
 
-  const renderError = (msg) => {
-    return '<!doctype html><meta charset=utf-8>'
-      + '<body style="font:14px/1.6 system-ui,sans-serif;padding:2em;color:#c00">'
-      + '<h2 style="font-size:1.2em">URLのデコードに失敗しました</h2>'
-      + '<pre style="background:#fee;padding:1em;border-radius:6px;color:#600;font-size:12px;white-space:pre-wrap;word-break:break-all">'
-      + escapeHtml(msg) + '</pre>'
-      + '<p style="color:#666;font-size:13px">URL中の <code>%</code> の後ろが正しい 16 進 2 桁になっているか確認してください。</p></body>';
+  /**
+   * location.hash の生文字列をHTMLとして復元する。
+   * AIやユーザーにエンコードを要求しない設計のため、以下のフォールバックで「とにかく表示を試みる」：
+   *   1. decodeURIComponent でデコード（ブラウザが自動エンコードした日本語・空白等を復元）
+   *   2. 失敗したら、孤立した % のみ %25 にエスケープして再デコード
+   *      （CSSの width:100%; のような生 % を救う）
+   *   3. それも失敗したら、生文字列をそのまま返す
+   */
+  const decodeHashHtml = (raw) => {
+    if (!raw) return '';
+    try {
+      return decodeURIComponent(raw);
+    } catch (e) {
+      try {
+        const safeRaw = raw.replace(/%(?![0-9A-Fa-f]{2})/g, '%25');
+        return decodeURIComponent(safeRaw);
+      } catch (e2) {
+        return raw;
+      }
+    }
   };
 
   /** location.hash からHTMLを取り出してフレームに反映 */
@@ -173,17 +186,7 @@
       setBusy(false);
       return;
     }
-    let html;
-    try {
-      html = decodeURIComponent(raw);
-    } catch (e) {
-      currentHtml = '';
-      titleEl.textContent = 'Artifact Viewer';
-      frame.srcdoc = renderError(String(e && e.message ? e.message : e));
-      setStatus('decode failed');
-      setBusy(false);
-      return;
-    }
+    const html = decodeHashHtml(raw);
     currentHtml = html;
     titleEl.textContent = extractTitle(html) || 'Artifact';
     frame.srcdoc = html;
