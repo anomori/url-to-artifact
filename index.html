@@ -37,6 +37,7 @@
     <button data-export="pptx" disabled>PPTX</button>
   </div>
   <button id="btn-copy">Copy URL</button>
+  <button id="btn-shorten" disabled>Copy Short URL</button>
 </header>
 <iframe id="frame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-same-origin"></iframe>
 <script>
@@ -46,6 +47,7 @@
   const titleEl = $('title');
   const statusEl = $('status');
   const copyBtn = $('btn-copy');
+  const shortenBtn = $('btn-shorten');
   const exportBtns = Array.from(document.querySelectorAll('[data-export]'));
   const progressEl = $('progress');
   const progressBar = $('progress-bar');
@@ -87,12 +89,16 @@
   };
   const hideProgress = () => { progressEl.hidden = true; progressBar.style.width = '0'; };
 
-  /** busy=true で全ボタン無効、false で復帰（エクスポート系はアーティファクト未ロード時は無効のまま） */
+  // CompressionStream API はモダンブラウザでサポート（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
+  const compressionSupported = typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
+
+  /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
     document.body.classList.toggle('busy', !!busy);
     const hasArtifact = !!currentHtml;
     exportBtns.forEach(b => { b.disabled = busy || !hasArtifact; });
     copyBtn.disabled = !!busy;
+    shortenBtn.disabled = !!busy || !hasArtifact || !compressionSupported;
     if (!busy) hideProgress();
   };
 
@@ -110,6 +116,36 @@
   const canvasToBlob = (canvas, type) => new Promise((res, rej) => {
     canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob returned null')), type);
   });
+
+  // ============================================================
+  // gzip 圧縮 / 展開（Copy Short URL 用）
+  // ============================================================
+  /** UTF-8 エンコード後のバイト列を gzip + base64url（URL安全）にまとめる。外部送信ゼロ。 */
+  const compressHtml = async (html) => {
+    const enc = new TextEncoder();
+    const stream = new Blob([enc.encode(html)]).stream().pipeThrough(new CompressionStream('gzip'));
+    const buf = await new Response(stream).arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  /** base64url(gzip) を復号して UTF-8 文字列に戻す */
+  const decompressHtml = async (b64url) => {
+    let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4;
+    if (pad) b64 += '='.repeat(4 - pad);
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const buf = await new Response(stream).arrayBuffer();
+    return new TextDecoder().decode(buf);
+  };
 
   // ============================================================
   // Lazy library loader
@@ -175,10 +211,14 @@
     }
   };
 
-  /** location.hash からHTMLを取り出してフレームに反映 */
-  const render = () => {
+  // hashchange の連続発火に備えて、render の最新世代だけが描画を反映するようにする
+  let renderSeq = 0;
+  /** location.hash からHTMLを取り出してフレームに反映（`#z=...` は gzip 圧縮されたペイロード） */
+  const render = async () => {
+    const mySeq = ++renderSeq;
     const raw = location.hash.slice(1);
     if (!raw) {
+      if (mySeq !== renderSeq) return;
       currentHtml = '';
       titleEl.textContent = 'Artifact Viewer';
       document.title = 'Artifact Viewer';
@@ -187,7 +227,29 @@
       setBusy(false);
       return;
     }
-    const html = decodeHashHtml(raw);
+    let html;
+    // `#z=<base64url>` 接頭辞は gzip+base64url 圧縮されたHTML（Copy Short URL で生成）
+    if (/^z=[A-Za-z0-9_-]+$/.test(raw)) {
+      if (!compressionSupported) {
+        if (mySeq !== renderSeq) return;
+        setStatus('compressed payload requires a modern browser (CompressionStream)');
+        frame.srcdoc = renderEmptyState();
+        setBusy(false);
+        return;
+      }
+      setStatus('decompressing...');
+      try {
+        html = await decompressHtml(raw.slice(2));
+      } catch (e) {
+        if (mySeq !== renderSeq) return;
+        setStatus('decompress failed: ' + (e && e.message ? e.message : e));
+        // フォールバック：生文字列としてデコード（壊れたペイロードでも何か表示する）
+        html = decodeHashHtml(raw);
+      }
+    } else {
+      html = decodeHashHtml(raw);
+    }
+    if (mySeq !== renderSeq) return;
     currentHtml = html;
     const ttl = extractTitle(html) || 'Artifact';
     titleEl.textContent = ttl;
@@ -400,9 +462,14 @@
     return first || undefined;
   };
 
-  /** DOM要素配下のテキストを書式付きランの配列として抽出（pptxgenjs addText形式） */
-  const extractRunsFromElement = (root, win) => {
+  /**
+   * DOM要素配下のテキストを書式付きランの配列として抽出（pptxgenjs addText形式）。
+   * @param fontScale 与えると要素ごとに fontSize (pt) も run options に反映する
+   */
+  const extractRunsFromElement = (root, win, fontScale) => {
     const runs = [];
+    const isInlineDsp = (d) => d === 'inline' || d === 'inline-block' || d === 'inline-flex' || d === 'inline-grid' || d === 'contents' || d === 'inline-table' || d === 'ruby';
+    const clampFontPt = (v) => Math.max(6, Math.min(96, v));
     const walk = (node, ctx) => {
       if (node.nodeType === 3) {
         const t = node.textContent;
@@ -418,13 +485,17 @@
       }
       const cs = win.getComputedStyle(node);
       if (cs.display === 'none' || cs.visibility === 'hidden') return;
+      // ブロックレベル要素の前にbreakLineを挿入（連続テキストを行で区切る、ルートはruns=0で自然にスキップ）
+      if (!isInlineDsp(cs.display) && runs.length > 0 && !runs[runs.length - 1].options.breakLine) {
+        runs[runs.length - 1].options = Object.assign({}, runs[runs.length - 1].options, { breakLine: true });
+      }
       const newCtx = Object.assign({}, ctx);
       const fw = parseInt(cs.fontWeight, 10);
       if ((!isNaN(fw) && fw >= 600) || tag === 'STRONG' || tag === 'B') newCtx.bold = true;
       if (cs.fontStyle === 'italic' || tag === 'EM' || tag === 'I') newCtx.italic = true;
-      const td = (cs.textDecorationLine || cs.textDecoration || '');
-      if (td.indexOf('underline') >= 0 || tag === 'U') newCtx.underline = { style: 'sng' };
-      if (td.indexOf('line-through') >= 0 || tag === 'S' || tag === 'STRIKE' || tag === 'DEL') newCtx.strike = 'sngStrike';
+      const tdline = (cs.textDecorationLine || cs.textDecoration || '');
+      if (tdline.indexOf('underline') >= 0 || tag === 'U') newCtx.underline = { style: 'sng' };
+      if (tdline.indexOf('line-through') >= 0 || tag === 'S' || tag === 'STRIKE' || tag === 'DEL') newCtx.strike = 'sngStrike';
       const c = cssColorToHex(cs.color);
       if (c) newCtx.color = c;
       if (tag === 'CODE' || tag === 'KBD' || tag === 'SAMP' || tag === 'TT') newCtx.fontFace = 'Consolas';
@@ -438,6 +509,11 @@
             newCtx.hyperlink = { url };
           }
         }
+      }
+      // fontScale が渡された場合は、要素ごとの font-size も run options に反映する
+      if (fontScale) {
+        const fpx = parseFloat(cs.fontSize);
+        if (!isNaN(fpx) && fpx > 0) newCtx.fontSize = clampFontPt(fpx * fontScale * 72);
       }
       Array.from(node.childNodes).forEach((ch) => walk(ch, newCtx));
     };
@@ -504,8 +580,15 @@
     });
     transformedEls.forEach(el => el.style.setProperty('transform', 'none', 'important'));
 
+    const HANDLED_SELECTOR = HANDLED.map(t => t.toLowerCase()).join(',');
     const collectLeaves = (root) => {
       const leaves = [];
+      const pushImgs = (el) => {
+        Array.from(el.querySelectorAll('img')).forEach((img) => {
+          const imgCs = win.getComputedStyle(img);
+          if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden') leaves.push(img);
+        });
+      };
       const visit = (el) => {
         if (!el || el.nodeType !== 1) return;
         const cs = win.getComputedStyle(el);
@@ -516,15 +599,38 @@
           leaves.push(el);
           // 段落・見出し等の中に <img> がある場合は、IMG も独立 leaf として追加し、
           // ネイティブ画像として配置する（p の runs が空なら addText はスキップされる）
-          if (tag !== 'IMG' && tag !== 'TABLE' && tag !== 'PRE') {
-            Array.from(el.querySelectorAll('img')).forEach((img) => {
-              const imgCs = win.getComputedStyle(img);
-              if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden') leaves.push(img);
-            });
-          }
+          if (tag !== 'IMG' && tag !== 'TABLE' && tag !== 'PRE') pushImgs(el);
           return;
         }
-        Array.from(el.children).forEach(visit);
+        // 非HANDLED要素 (div, header, footer など) の処理：
+        // (a) 配下に HANDLED 要素があれば children を再帰探索する
+        if (el.querySelector(HANDLED_SELECTOR)) {
+          Array.from(el.children).forEach(visit);
+          return;
+        }
+        // (b) HANDLED 配下なし。div だけで構成されたUI（カードグリッド・タイムライン等）に対応：
+        //     テキストor画像を持つ要素の子が複数あれば、それぞれを再帰してflex/grid各セルを保つ
+        const textOrImageChildren = Array.from(el.children).filter(c => {
+          if (c.nodeType !== 1) return false;
+          const ccs = win.getComputedStyle(c);
+          if (ccs.display === 'none' || ccs.visibility === 'hidden') return false;
+          if (c.tagName === 'IMG') return true;
+          const ct = c.textContent && c.textContent.trim();
+          return !!ct || !!c.querySelector('img');
+        });
+        if (textOrImageChildren.length > 1) {
+          textOrImageChildren.forEach(visit);
+          return;
+        }
+        // (c) 子コンテンツが1つ以下 → 自身がテキストを持つなら leaf として配置
+        const selfText = el.textContent && el.textContent.trim();
+        if (selfText) {
+          leaves.push(el);
+          pushImgs(el); // コンテナ内の <img> は独立配置
+          return;
+        }
+        // (d) 画像のみのコンテナ
+        pushImgs(el);
       };
       Array.from(root.children).forEach(visit);
       return leaves;
@@ -598,7 +704,7 @@
                 const tdfill = cssColorToHex(tdcs.backgroundColor);
                 const tdcolor = cssColorToHex(tdcs.color);
                 const tdfsize = parseFloat(tdcs.fontSize) || fontSizePx;
-                const cellRuns = extractRunsFromElement(td, win);
+                const cellRuns = extractRunsFromElement(td, win, fontScale);
                 return {
                   // 空セルはスペース1つをプレースホルダーとして返す（pptxgenjsの表セルに text: [] を渡すと不安定）
                   text: cellRuns.length > 0 ? cellRuns : [{ text: ' ', options: {} }],
@@ -624,7 +730,7 @@
             if (items.length === 0) continue;
             const arr = [];
             items.forEach((li, idx) => {
-              const liRuns = extractRunsFromElement(li, win);
+              const liRuns = extractRunsFromElement(li, win, fontScale);
               if (liRuns.length === 0) liRuns.push({ text: ' ', options: {} });
               for (let k = 0; k < liRuns.length; k++) {
                 if (k === liRuns.length - 1 && idx < items.length - 1) {
@@ -663,7 +769,7 @@
             continue;
           }
           // h1-h6, p, blockquote, figcaption
-          const runs = extractRunsFromElement(el, win);
+          const runs = extractRunsFromElement(el, win, fontScale);
           if (runs.length === 0) continue;
           slide.addText(runs, {
             x, y, w, h,
@@ -866,7 +972,7 @@
   };
 
   // ============================================================
-  // Copy URL
+  // Copy URL / Copy Short URL
   // ============================================================
   const copyUrl = async () => {
     try {
@@ -876,6 +982,40 @@
       setTimeout(() => { copyBtn.textContent = original; }, 1500);
     } catch (e) {
       setStatus('copy failed: ' + (e && e.message ? e.message : e));
+    }
+  };
+
+  /**
+   * 現在のアーティファクトを gzip+base64url で圧縮し、`#z=...` 形式の短縮URLとしてクリップボードへコピーする。
+   * 外部サービスへの送信は一切行わず、ブラウザ内蔵の CompressionStream API のみ使用する。
+   * 圧縮率は内容に依存するが、典型的には元の30〜50%。SNS に貼れる「本当に短いURL」にはならない点に注意。
+   */
+  const copyShortUrl = async () => {
+    if (!currentHtml) {
+      setStatus('No artifact to compress');
+      return;
+    }
+    if (!compressionSupported) {
+      setStatus('CompressionStream is not supported on this browser');
+      return;
+    }
+    setBusy(true);
+    setStatus('compressing...');
+    try {
+      const compressed = await compressHtml(currentHtml);
+      const shortUrl = location.origin + location.pathname + '#z=' + compressed;
+      const originalLen = location.href.length;
+      const newLen = shortUrl.length;
+      const ratio = originalLen > 0 ? Math.round((newLen / originalLen) * 100) : 0;
+      await navigator.clipboard.writeText(shortUrl);
+      const original = shortenBtn.textContent;
+      shortenBtn.textContent = 'Copied';
+      setTimeout(() => { shortenBtn.textContent = original; }, 1500);
+      setStatus('Short URL copied (' + formatBytes(originalLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
+    } catch (e) {
+      setStatus('shorten failed: ' + (e && e.message ? e.message : e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -900,6 +1040,7 @@
   });
 
   copyBtn.addEventListener('click', copyUrl);
+  shortenBtn.addEventListener('click', copyShortUrl);
 
   // === Initial render ===
   render();
