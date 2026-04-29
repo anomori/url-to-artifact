@@ -20,12 +20,16 @@
   iframe{flex:1;width:100%;border:0;background:#fff;display:block;min-height:0}
   body.busy{cursor:progress}
   body.busy #toolbar button{cursor:progress}
+  #toolbar .progress{position:relative;flex-shrink:0;width:100px;height:5px;background:#eee;border-radius:3px;overflow:hidden}
+  #toolbar .progress[hidden]{display:none}
+  #toolbar #progress-bar{height:100%;width:0;background:#3b82f6;transition:width .15s ease-out}
 </style>
 </head>
 <body>
 <header id="toolbar">
   <h1 id="title">Artifact Viewer</h1>
   <span class="status" id="status"></span>
+  <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
   <div class="group" role="group" aria-label="Export">
     <button data-export="html" disabled>HTML</button>
     <button data-export="png" disabled>PNG</button>
@@ -43,6 +47,8 @@
   const statusEl = $('status');
   const copyBtn = $('btn-copy');
   const exportBtns = Array.from(document.querySelectorAll('[data-export]'));
+  const progressEl = $('progress');
+  const progressBar = $('progress-bar');
 
   /** 現在表示中のHTMLソース（エクスポート用に保持） */
   let currentHtml = '';
@@ -72,12 +78,22 @@
 
   const setStatus = (msg) => { statusEl.textContent = msg || ''; };
 
+  /** 多段処理の進捗バー。total<=1 のときは非表示 */
+  const showProgress = (current, total) => {
+    if (!total || total <= 1) { progressEl.hidden = true; return; }
+    progressEl.hidden = false;
+    const pct = Math.max(0, Math.min(100, (current / total) * 100));
+    progressBar.style.width = pct + '%';
+  };
+  const hideProgress = () => { progressEl.hidden = true; progressBar.style.width = '0'; };
+
   /** busy=true で全ボタン無効、false で復帰（エクスポート系はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
     document.body.classList.toggle('busy', !!busy);
     const hasArtifact = !!currentHtml;
     exportBtns.forEach(b => { b.disabled = busy || !hasArtifact; });
     copyBtn.disabled = !!busy;
+    if (!busy) hideProgress();
   };
 
   const downloadBlob = (blob, filename) => {
@@ -110,7 +126,7 @@
   const URLS = {
     html2canvas: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
     jspdf:       'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-    pptxgen:     'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js',
+    pptxgen:     'https://cdnjs.cloudflare.com/ajax/libs/pptxgenjs/3.12.0/pptxgen.bundle.min.js',
     jszip:       'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'
   };
 
@@ -213,10 +229,11 @@
 
   /**
    * スライド構造を自動検出して順番に撮影。
-   *   reveal.js   : Reveal.slide(h,v,f) で全スライドを巡回（transition: none）
-   *   汎用<section>: body / main / .slides 直下の <section>・.slide を display 切替で巡回
+   *   reveal.js    : Reveal.slide(h,v,f) で全スライドを巡回（transition: none）
+   *   汎用<section>: body / main / .slides / .marpit 直下の <section>・.slide を display 切替で巡回
+   *   <hr> 区切り  : body 直下の <hr> でグルーピングして display 切替で巡回（Markdown の --- 由来など）
    *   フォールバック : 全体1枚
-   * 戻り値: { canvases: HTMLCanvasElement[], mode: 'reveal'|'sections'|'single' }
+   * 戻り値: { canvases: HTMLCanvasElement[], mode: 'reveal'|'sections'|'hr'|'single' }
    */
   const captureSlides = async () => {
     await loadScript(URLS.html2canvas);
@@ -250,6 +267,7 @@
             try { Reveal.slide(idx.h || 0, idx.v || 0, idx.f); } catch (e) {}
             await sleep(150);
             await next2Frames();
+            showProgress(i + 1, slides.length);
             setStatus('exporting slide ' + (i + 1) + '/' + slides.length + '...');
             canvases.push(await snapshot(doc, ww, hh));
           }
@@ -265,6 +283,7 @@
     // ---- 汎用セクション分割 ----
     const selectors = [
       'body > section',
+      '.marpit > section',
       'body > .slide',
       'body > div.slide',
       'main > section',
@@ -284,6 +303,7 @@
         for (let i = 0; i < sections.length; i++) {
           sections.forEach((s, j) => { s.style.display = (i === j) ? '' : 'none'; });
           await next2Frames();
+          showProgress(i + 1, sections.length);
           setStatus('exporting slide ' + (i + 1) + '/' + sections.length + '...');
           const visibleH = sections[i].scrollHeight || doc.documentElement.scrollHeight;
           canvases.push(await snapshot(doc, ww, visibleH));
@@ -292,6 +312,42 @@
         sections.forEach((s, j) => { s.style.display = original[j]; });
       }
       return { canvases, mode: 'sections' };
+    }
+
+    // ---- <hr> 区切りスライド (Markdown→HTML 直変換などで body 直下に <hr> が並ぶケース) ----
+    const allHrs = Array.from(doc.querySelectorAll('body > hr'));
+    if (allHrs.length >= 2) {
+      const allEls = Array.from(doc.body.children).filter(el => el.tagName !== 'SCRIPT' && el.tagName !== 'STYLE');
+      const groups = [];
+      let current = [];
+      for (const el of allEls) {
+        if (el.tagName === 'HR') {
+          if (current.length > 0) { groups.push(current); current = []; }
+        } else {
+          current.push(el);
+        }
+      }
+      if (current.length > 0) groups.push(current);
+
+      if (groups.length > 1) {
+        const original = allEls.map(el => el.style.display);
+        const ww = doc.documentElement.scrollWidth;
+        const canvases = [];
+        try {
+          for (let i = 0; i < groups.length; i++) {
+            const visible = new Set(groups[i]);
+            allEls.forEach(el => { el.style.display = visible.has(el) ? '' : 'none'; });
+            await next2Frames();
+            showProgress(i + 1, groups.length);
+            setStatus('exporting slide ' + (i + 1) + '/' + groups.length + '...');
+            const visibleH = doc.body.scrollHeight || doc.documentElement.scrollHeight;
+            canvases.push(await snapshot(doc, ww, visibleH));
+          }
+        } finally {
+          allEls.forEach((el, j) => { el.style.display = original[j]; });
+        }
+        return { canvases, mode: 'hr' };
+      }
     }
 
     // ---- フォールバック：全体1枚 ----
@@ -322,6 +378,7 @@
       const zip = new window.JSZip();
       const padLen = String(canvases.length).length;
       for (let i = 0; i < canvases.length; i++) {
+        showProgress(i + 1, canvases.length);
         setStatus('packing PNG ' + (i + 1) + '/' + canvases.length + '...');
         const blob = await canvasToBlob(canvases[i], 'image/png');
         const idx = String(i + 1).padStart(padLen, '0');
@@ -338,17 +395,23 @@
       const { canvases, mode } = await captureSlides();
       const { jsPDF } = window.jspdf;
 
-      // 単一モード（プレゼンではない通常のアーティファクト）
-      // → 縦長いときは A4縦にページ自動分割、フィットするときは従来通り 1ページ
+      // 単一モード（通常のアーティファクト）
+      // → 縦横比からA4の向きを決め、長辺方向にページ自動分割
       if (mode === 'single' && canvases.length === 1) {
         const c = canvases[0];
-        const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4', compress: true });
+        const orient = c.width >= c.height ? 'landscape' : 'portrait';
+        const pdf = new jsPDF({ orientation: orient, unit: 'pt', format: 'a4', compress: true });
         const pw = pdf.internal.pageSize.getWidth();
         const ph = pdf.internal.pageSize.getHeight();
-        const scale = pw / c.width;            // canvasピクセル×scale = PDFポイント
-        const scaledH = c.height * scale;       // 全体をページ幅に合わせたときの高さ
-        if (scaledH <= ph) {
-          // 1ページに収まる → 従来のレターボックス
+        const isPortrait = orient === 'portrait';
+        // 短辺をページに合わせる縮尺
+        const scale = isPortrait ? pw / c.width : ph / c.height;
+        const longCanvas = isPortrait ? c.height : c.width;     // 元キャンバスの長辺ピクセル
+        const longPage = isPortrait ? ph : pw;                  // PDFページの長辺pt
+        const longScaled = longCanvas * scale;                  // 長辺を縮尺後
+
+        if (longScaled <= longPage + 0.5) {
+          // 1ページに収まる → レターボックス
           const r = Math.min(pw / c.width, ph / c.height);
           const w = c.width * r;
           const h = c.height * r;
@@ -356,25 +419,35 @@
           pdf.save(baseFilename() + '.pdf');
           setStatus('PDF saved (1 page, mode=single)');
         } else {
-          // 縦に長い → 1ページごとにキャンバスをスライス
-          const pageHInCanvas = ph / scale;     // 1ページ分の元キャンバス高さ
-          const pageCount = Math.ceil(c.height / pageHInCanvas);
+          // 長辺方向にページ分割
+          const pageInCanvas = longPage / scale;
+          const pageCount = Math.ceil(longCanvas / pageInCanvas);
           const slicer = document.createElement('canvas');
-          slicer.width = c.width;
+          if (isPortrait) slicer.width = c.width; else slicer.height = c.height;
           const sctx = slicer.getContext('2d');
           for (let i = 0; i < pageCount; i++) {
-            const sy = i * pageHInCanvas;
-            const sliceH = Math.min(pageHInCanvas, c.height - sy);
-            slicer.height = Math.ceil(sliceH);
+            const start = i * pageInCanvas;
+            const sliceLen = Math.min(pageInCanvas, longCanvas - start);
+            if (isPortrait) slicer.height = Math.ceil(sliceLen);
+            else slicer.width = Math.ceil(sliceLen);
             sctx.fillStyle = '#ffffff';
             sctx.fillRect(0, 0, slicer.width, slicer.height);
-            sctx.drawImage(c, 0, sy, c.width, sliceH, 0, 0, c.width, sliceH);
-            if (i > 0) pdf.addPage('a4', 'portrait');
-            pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, pw, sliceH * scale, undefined, 'FAST');
+            if (isPortrait) {
+              sctx.drawImage(c, 0, start, c.width, sliceLen, 0, 0, c.width, sliceLen);
+            } else {
+              sctx.drawImage(c, start, 0, sliceLen, c.height, 0, 0, sliceLen, c.height);
+            }
+            if (i > 0) pdf.addPage('a4', orient);
+            if (isPortrait) {
+              pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, pw, sliceLen * scale, undefined, 'FAST');
+            } else {
+              pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, sliceLen * scale, ph, undefined, 'FAST');
+            }
+            showProgress(i + 1, pageCount);
             setStatus('rendering PDF page ' + (i + 1) + '/' + pageCount + '...');
           }
           pdf.save(baseFilename() + '.pdf');
-          setStatus('PDF saved (' + pageCount + ' pages, mode=long-page)');
+          setStatus('PDF saved (' + pageCount + ' pages, mode=long-page-' + (isPortrait ? 'v' : 'h') + ')');
         }
         return;
       }
@@ -393,6 +466,8 @@
         const w = c.width * r;
         const h = c.height * r;
         pdf.addImage(c.toDataURL('image/png'), 'PNG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+        showProgress(i + 1, canvases.length);
+        setStatus('rendering PDF page ' + (i + 1) + '/' + canvases.length + '...');
       }
       pdf.save(baseFilename() + '.pdf');
       setStatus('PDF saved (' + canvases.length + ' page' + (canvases.length === 1 ? '' : 's') + ', mode=' + mode + ')');
