@@ -156,7 +156,9 @@
    *   小文字 (b/z/d/s/l) = A-3 辞書なし、大文字 (B/Z/D/S/L) = A-3 辞書あり
    *   数字プレフィックス (1b, 1B 等) = カスタム辞書プレフィックス v1〜 適用
    */
-  const SHORT_URL_HASH_RE = /^(\d?)([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
+  // version プレフィックスは複数桁許容 (\d*)。CURRENT_DICT_VERSION が 10 を超えても動くよう、
+  // 将来の辞書追加に備えて多桁対応にしておく。なお customDictVersion=0 (辞書なし) は数字なし表記。
+  const SHORT_URL_HASH_RE = /^(\d*)([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
 
   /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
@@ -220,7 +222,19 @@
     work = work.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, preserve);
     // <style> 内 CSS をミニファイしてから保護
     work = work.replace(/(<style[^>]*>)([\s\S]*?)(<\/style>)/gi, (_, o, css, c) => {
-      let s = css.replace(/\/\*[\s\S]*?\*\//g, '');
+      // CSS 中の引用符付き文字列 ("..." / '...') を退避してから minify ルールを適用する。
+      // これをしないと content:"Hello, world" のような疑似要素テキスト、font-family:"Foo 0.5"
+      // のような特殊フォント名、attr() のフォールバック文字列等の中身が、コンマ畳み込み・
+      // 0px→0・0.5→.5・hex短縮・rgba 正規化等によって書き換えられて表示が崩れる。
+      // バックスラッシュエスケープ (\" \') を含む文字列にも対応。
+      const cssStrings = [];
+      const cssMarker = 'UATCSS' + Math.random().toString(36).slice(2, 10) + 'X';
+      let s = css.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => {
+        const t = cssMarker + cssStrings.length + 'X';
+        cssStrings.push(m);
+        return t;
+      });
+      s = s.replace(/\/\*[\s\S]*?\*\//g, '');
       s = s.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
       s = s.replace(/\s*\{\s*/g, '{').replace(/;\s*}\s*/g, '}').replace(/\s*}\s*/g, '}');
       // プロパティ宣言のコロン後スペース除去 (font-weight: bold → font-weight:bold)
@@ -237,6 +251,28 @@
       // font-weight shorthand (bold→700, normal→400)
       s = s.replace(/font-weight:bold\b/g, 'font-weight:700');
       s = s.replace(/font-weight:normal\b/g, 'font-weight:400');
+      // rgb/rgba の固定パターンを短縮形へ変換。色値の冗長表記を1パターンに集約し辞書・LZマッチ効率を上げる。
+      // alpha=1 は #rrggbb 同等、alpha=0 は transparent 同等として安全。
+      s = s.replace(/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*1\s*\)/g, '#000');
+      s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*1\s*\)/g, '#fff');
+      s = s.replace(/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/g, 'transparent');
+      s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*0\s*\)/g, 'transparent');
+      // margin/padding の同値ショートハンド。CSSは1値=全方向、、3値 0 0 0 は上・左右・下として全て 0 なので 1値に集約可能。
+      s = s.replace(/\b(margin|padding):0 0 0 0\b/g, '$1:0');
+      s = s.replace(/\b(margin|padding):0 0 0\b(?![ \d])/g, '$1:0');
+      s = s.replace(/\b(margin|padding):0 0\b(?![ \d])/g, '$1:0');
+      // outline:none → outline:0 (1文字短縮)、border:none → border:0 (3文字短縮)
+      // background:none は border-image 付きショートハンドとは意味が違うため変換しない (安全側)。
+      s = s.replace(/\boutline:none\b/g, 'outline:0');
+      s = s.replace(/\bborder:none\b/g, 'border:0');
+      s = s.replace(/\bborder-(top|right|bottom|left):none\b/g, 'border-$1:0');
+      // 並んだセレクターコンマの前後空白も復入させる (a , b → a,b)
+      s = s.replace(/\s*,\s*/g, ',');
+      // タグ関連以外の冗長セミコロンを除去 (とされていない最後のプロパティ ; は不要)
+      s = s.replace(/;}/g, '}');
+      // 退避した文字列を復元
+      const cssRestoreRe = new RegExp(cssMarker + '(\\d+)X', 'g');
+      s = s.replace(cssRestoreRe, (_, idx) => cssStrings[parseInt(idx, 10)] || '');
       return preserve(o + s + c);
     });
     // HTML コメント除去（条件付きコメントは保持）
@@ -260,6 +296,36 @@
     // デフォルト type 属性を除去（button の submit と input の text はデフォルト値）
     work = work.replace(/(<button\b[^>]*?) type=submit/gi, '$1');
     work = work.replace(/(<input\b[^>]*?) type=text/gi, '$1');
+    // HTML エンティティを短い形式に正規化。&apos; は HTML5 で初出だが &#39; は HTML4 も含め全ブラウザでサポートされており 1 文字短い。
+    // <pre>/<script>/<style>/<textarea>/<code> 内は preserve 済みなので、コード中の &apos; リテラルを誤って変換する事故は起きない。
+    work = work.replace(/&apos;/g, '&#39;');
+    // 属性のアルファベット順ソート（LZ系圧縮の繰り返しパターン増加目的）。
+    // pre/textarea/script/style/code は preserve 済みなので attrsStr にマーカー文字列が含まれることはない。
+    // case-insensitive ソートにより SVG の viewBox / preserveAspectRatio など大文字混じり属性も
+    // 周りの小文字属性と一貫した順序で並ぶ。重複属性（例: class=a class=b）はそのまま保持
+    // （実際には不正な HTML だが、ブラウザは先頭の値を採用するためソートしても意味を保つ）。
+    // outer regex は「タグ名 + 1個以上の属性 + (optional /) + >」を明示的にマッチさせる。
+    // 単に [^<>]*? にすると <a title="2 > 1"> のように引用符内の > でタグが切られて
+    // 属性値を損ねる事故が起きるため、引用あり値をクォート規則ではなくトークンレベルで認識させる。
+    work = work.replace(/<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[a-zA-Z_:][\w:.-]*(?:=(?:"[^"]*"|'[^']*'|[^\s"'`=<>]+))?)+)\s*(\/?)>/g, (match, tag, attrsStr, slash) => {
+      // 属性なし or 単一属性は変換不要。クォート/未クォート/値なしをすべてキャッチ。
+      const re = /([a-zA-Z_:][\w:.-]*)(?:=("[^"]*"|'[^']*'|[^\s"'`=<>\/]+))?/g;
+      const list = [];
+      let am;
+      while ((am = re.exec(attrsStr))) {
+        list.push({ name: am[1], value: am[2] });
+      }
+      if (list.length < 2) return match;
+      // 安定ソート（name が同じ場合は元順）にするため index を tiebreaker に使う。
+      const indexed = list.map((a, i) => ({ a, i }));
+      indexed.sort((x, y) => {
+        const xn = x.a.name.toLowerCase(), yn = y.a.name.toLowerCase();
+        if (xn < yn) return -1;
+        if (xn > yn) return 1;
+        return x.i - y.i;
+      });
+      return '<' + tag + indexed.map(({ a }) => ' ' + a.name + (a.value !== undefined ? '=' + a.value : '')).join('') + slash + '>';
+    });
     // マーカー復元
     const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
     work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
@@ -273,8 +339,11 @@
    * トークンは互いに部分一致しないように選定（split/join はメタ文字を気にせず確実に置換できる）。
    */
   const DICT_TOKENS = [
-    '<meta name=viewport content="width=device-width,initial-scale=1.0">',
-    '<meta name=viewport content="width=device-width,initial-scale=1">',
+    // 属性は minifyHtml の最終ステップでアルファベット順にソートされるため、
+    // 辞書側も c < n の順 (content → name) で登録する必要がある。逆順にすると
+    // 入力 HTML 側に永久に一致せず A-3 静的辞書による圧縮が効かない。
+    '<meta content="width=device-width,initial-scale=1.0" name=viewport>',
+    '<meta content="width=device-width,initial-scale=1" name=viewport>',
     '<meta charset=UTF-8>',
     '<meta charset=utf-8>',
     '<!DOCTYPE html>',
@@ -469,9 +538,67 @@
     + 'function(){return}const =>{Math.floor(Math.random()*'
     + 'JSON.stringify(JSON.parse(console.log("'
     + '<\/script>';
+  // V3: 属性アルファベット順ソート対応 + display:grid/sticky position/inset 等のモダンCSSパターン強化
+  // + JS arrow 短縮 (=>{...) と頻出メソッド (classList.toggle, getAttribute 等) 拡充。
+  // 辞書サイズは約 3KB。Brotli/zstd/LZMA は 8MB+ ウィンドウなので余裕で参照可能。
+  // deflate-raw/gzip は 32KB ウィンドウだが、入力サイズが小さければ最良ケースとして採用される。
+  const CUSTOM_DICT_V3 = '<!DOCTYPE html><html lang=en><head><meta charset=UTF-8>'
+    + '<meta content="width=device-width,initial-scale=1" name=viewport>'
+    + '<title></title><style>'
+    + '*{box-sizing:border-box;margin:0;padding:0}'
+    + 'body{background:#fff;color:#333;font-family:system-ui,-apple-system,sans-serif;line-height:1.5}'
+    + '.container{margin:0 auto;max-width:1200px;padding:0 20px;width:100%}'
+    + 'display:flex;display:grid;display:none;display:block;display:inline-block;display:inline-flex;'
+    + 'align-items:center;align-items:flex-start;align-items:flex-end;align-items:stretch;'
+    + 'justify-content:center;justify-content:space-between;justify-content:flex-start;justify-content:flex-end;justify-content:space-around;'
+    + 'flex-direction:column;flex-direction:row;flex-wrap:wrap;flex:1;flex-grow:1;flex-shrink:0;'
+    + 'position:relative;position:absolute;position:fixed;position:sticky;'
+    + 'top:0;left:0;right:0;bottom:0;inset:0;'
+    + 'font-size:12px;font-size:14px;font-size:16px;font-size:18px;font-size:20px;font-size:24px;font-size:28px;font-size:32px;'
+    + 'font-weight:400;font-weight:500;font-weight:600;font-weight:700;font-weight:800;'
+    + 'text-align:center;text-align:left;text-align:right;text-align:justify;'
+    + 'color:#000;color:#333;color:#555;color:#666;color:#888;color:#999;color:#fff;color:inherit;'
+    + 'background:#fff;background:#000;background:#f5f5f5;background:#fafafa;background:transparent;'
+    + 'background-color:#fff;background-color:#f5f5f5;background-color:transparent;'
+    + 'border-radius:4px;border-radius:6px;border-radius:8px;border-radius:12px;border-radius:16px;border-radius:50%;border-radius:9999px;'
+    + 'padding:4px;padding:8px;padding:12px;padding:16px;padding:20px;padding:24px;padding:32px;'
+    + 'padding:0 8px;padding:0 16px;padding:0 20px;padding:8px 16px;padding:12px 24px;'
+    + 'margin:0 auto;margin:0;margin:8px;margin:16px;margin-bottom:8px;margin-bottom:16px;margin-bottom:24px;margin-top:0;margin-top:16px;'
+    + 'width:100%;height:100%;max-width:100%;min-height:100vh;height:100vh;'
+    + 'overflow:hidden;overflow:auto;overflow:scroll;overflow-x:auto;overflow-y:auto;'
+    + 'border:0;border:1px solid #ddd;border:1px solid #eee;border:2px solid;border-bottom:1px solid #eee;border-top:1px solid #eee;'
+    + 'box-shadow:0 1px 2px rgba(0,0,0,.05);box-shadow:0 1px 3px rgba(0,0,0,.1);box-shadow:0 2px 4px rgba(0,0,0,.1);box-shadow:0 4px 6px rgba(0,0,0,.1);box-shadow:0 10px 15px rgba(0,0,0,.1);'
+    + 'transition:all .2s;transition:all .3s ease;transition:transform .3s;transition:opacity .2s;transition:background .2s;'
+    + 'transform:translateX(0);transform:translateY(0);transform:scale(1);transform:rotate(0);transform:translate(-50%,-50%);'
+    + 'opacity:0;opacity:.5;opacity:.7;opacity:.8;opacity:1;cursor:pointer;cursor:default;cursor:not-allowed;'
+    + 'gap:4px;gap:8px;gap:12px;gap:16px;gap:20px;gap:24px;gap:32px;'
+    + 'z-index:0;z-index:1;z-index:10;z-index:100;z-index:999;z-index:9999;'
+    + 'white-space:nowrap;text-overflow:ellipsis;text-decoration:none;text-decoration:underline;'
+    + 'list-style:none;border-collapse:collapse;line-height:1;line-height:1.2;line-height:1.5;line-height:1.6;'
+    + 'grid-template-columns:repeat(2,1fr);grid-template-columns:repeat(3,1fr);grid-template-columns:repeat(4,1fr);grid-template-columns:1fr 1fr;'
+    + '@media (max-width:768px){@media (min-width:768px){@media (max-width:1024px){@media print{'
+    + '</style><body>'
+    + '<div class=container><div class=row><div class=col>'
+    + '<div class=card><div class=header><div class=footer><div class=content><div class=wrapper><div class=section>'
+    + '<span class=label><span class=icon><button class=btn type=button>'
+    + '<a class=link href="#"><a href="#">'
+    + '<img alt="" src=""><input name="" placeholder="">'
+    + '<h1 class=""><h2 class=""><h3 class=""><p class=""><section class="">'
+    + '</a></button></div></h1></h2></h3></p></section></span></ul></ol>'
+    + '<svg fill=none height=24 stroke=currentColor stroke-linecap=round stroke-linejoin=round stroke-width=2 viewBox="0 0 24 24" width=24 xmlns="http://www.w3.org/2000/svg">'
+    + '<path d="M</svg>'
+    + 'addEventListener("DOMContentLoaded",()=>{'
+    + 'addEventListener("click",e=>{e.preventDefault();'
+    + 'document.querySelector(".document.querySelectorAll(".'
+    + 'document.getElementById("classList.add("classList.remove("classList.toggle("classList.contains("'
+    + 'style.display=innerHTML="textContent="setAttribute("getAttribute("'
+    + 'JSON.stringify(JSON.parse(console.log("console.error("Math.floor(Math.random()*Math.PI*Math.max(Math.min('
+    + 'forEach((,i)=>{filter(=>{map(=>{reduce((,b)=>{const = =>{return}let =0;'
+    + 'function(){return}=>{}=>{return}'
+    + '<\/script>';
   // バージョン管理配列: index=バージョン番号。0=辞書なし。新辞書は末尾に append するだけ。
-  const CUSTOM_DICTS = [null, CUSTOM_DICT_V1, CUSTOM_DICT_V2];
-  const CURRENT_DICT_VERSION = 2;
+  const CUSTOM_DICTS = [null, CUSTOM_DICT_V1, CUSTOM_DICT_V2, CUSTOM_DICT_V3];
+  const CURRENT_DICT_VERSION = 3;
   /** 辞書をデータ先頭に付加 */
   const dictPrefixApply = (text, version) => {
     const dict = CUSTOM_DICTS[version];
@@ -1050,10 +1177,17 @@
       try {
         // 不正な色文字列が代入されたときに前回値が残ると「不正」を「センチネル色」と誤認
         // してしまうため、代入前に実コードでほぼ使われないセンチネルを置いて検出する。
+        // ただし fillStyle の読み返し形式はブラウザ依存で、CSS Color Level 4 以降では
+        // '#01020a' を代入しても 'rgb(1, 2, 10)' という文字列で返される可能性があるため、
+        // ハードコードではなく「代入直後に読み戻した値」をセンチネルとして使う。
+        // これをせず '#01020a' との直接比較にしていると、上記ブラウザでは
+        // 「不正な色 → norm='rgb(1, 2, 10)' ≡ センチネルだが文字列不一致」と誤判定され、
+        // センチネル色を「有効なユーザ指定色」として PPTX に間違った色が出る。
         _colorNormCanvas.fillStyle = '#01020a';
+        const sentinel = String(_colorNormCanvas.fillStyle);
         _colorNormCanvas.fillStyle = s;
         const norm = String(_colorNormCanvas.fillStyle);
-        if (norm !== '#01020a') {
+        if (norm !== sentinel) {
           m = norm.match(RGB_RE);
           if (!m) {
             const hexm = norm.match(/^#([0-9a-fA-F]{6})$/);
@@ -1145,6 +1279,19 @@
       Array.from(node.childNodes).forEach((ch) => walk(ch, newCtx));
     };
     walk(root, {});
+    // 末尾の「不要な breakLine」を除去する。ブロック要素出口で付与された自動改行
+    // （次のブロックとの間を区切るための何か）が、実際には次がないケース (例: <p>foo</p><p></p>
+    // や <h1>title</h1> だけのテキストフレーム) ではテキスト末尾に意味のない空行が出る。
+    // ただし <br> 由来の breakLineマーカー (text === '' && breakLine === true) はユーザ明示の改行意図なので
+    // 保持し、text が空でない run に付いた末尾の自動 breakLine のみを除ける。
+    if (runs.length > 0) {
+      const last = runs[runs.length - 1];
+      if (last.options.breakLine && last.text !== '') {
+        const newOpts = Object.assign({}, last.options);
+        delete newOpts.breakLine;
+        last.options = newOpts;
+      }
+    }
     return runs;
   };
 
