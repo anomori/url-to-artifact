@@ -643,10 +643,9 @@
     // ブラウザタブにも反映（複数タブで区別しやすくする）
     document.title = ttl + ' — Artifact Viewer';
     frame.srcdoc = html;
-    // html.length は UTF-16 コードユニット数で、日本語など多バイト文字を含むアーティファクトでは
-    // 実際の UTF-8 バイト数の約 1/3 になる (例: 300 KB の URL が 「100 KB」と表示)。
-    // Blob サイズで正確な UTF-8 バイト数を取る。
-    setStatus(formatBytes(new Blob([html]).size));
+    // html.length は UTF-16 コードユニット数なので多バイト文字では少なめに出るが、
+    // Blob 生成でトラブルが起きていたためシンプルなコードユニット数に戻す。
+    setStatus(formatBytes(html.length));
     lastContentHash = raw;
     setBusy(false);
   };
