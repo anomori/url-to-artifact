@@ -28,7 +28,7 @@
 <body>
 <header id="toolbar">
   <h1 id="title">Artifact Viewer</h1>
-  <span class="status" id="status"></span>
+  <span class="status" id="status" aria-live="polite" aria-atomic="true"></span>
   <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
   <div class="group" role="group" aria-label="Export">
     <button data-export="html" disabled>HTML</button>
@@ -62,9 +62,29 @@
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 
+  // 主要 HTML エンティティを文字に戻す。タイトル抽出やファイル名生成で使い、
+  // `<title>Foo &amp; Bar</title>` を `Foo & Bar` として表示する（これをしないと
+  // ブラウザタブ、ファイル名、PPTX タイトルに `&amp;` `&#x3042;` といった
+  // 実体参照がそのまま残る）。`&amp;` は二重デコード防止のため最後に処理する。
+  const decodeHtmlEntities = (s) => String(s)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => {
+      const cp = parseInt(n, 10);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
+      const cp = parseInt(n, 16);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+    })
+    .replace(/&amp;/g, '&');
+
   const extractTitle = (html) => {
     const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    return m ? m[1].trim() : null;
+    return m ? decodeHtmlEntities(m[1].trim()) : null;
   };
 
   const sanitizeFilename = (name) =>
@@ -89,18 +109,49 @@
   };
   const hideProgress = () => { progressEl.hidden = true; progressBar.style.width = '0'; };
 
-  // CompressionStream API はモダンブラウザでサポート（gzip: Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
+  // CompressionStream API はモダンブラウザでサポート（Compression Streams API: Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
   const compressionSupported = typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
-  // Brotli は gzip より 15〜25% 圧縮率が高いが対応ブラウザが新しい（Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+）。
-  // 圧縮側と展開側で個別判定し、片方だけ対応の環境でも安全に挙動を決められるようにする。
-  const brotliCompressSupported = (() => {
+
+  /**
+   * 短縮URL用に試行する圧縮形式の定義。試行順 = 同点時の優先順。
+   *   zstd       : Firefox 149+ のみ CompressionStream API 対応。HTML系で brotli と同等以上に縮むことがある
+   *   brotli     : Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+。HTML/CSS/JS で gzip より 15〜25% 短くなる
+   *   deflate-raw: 全主要ブラウザで対応。gzip と同じDEFLATE圧縮だがヘッダなしで約 18 バイト短い
+   *   gzip       : 全主要ブラウザで対応。互換性のため残す（実質 deflate-raw に劣後）
+   *   lzma       : LZMA-JS (CDN遅延ロード)。HTML/CSS/JS で brotli より 5〜15% 縮むことがあるが、圧縮時間は数秒オーダー
+   * CompressionStream 系は圧縮側と展開側で個別判定。LZMA は外部ライブラリなので別管理。
+   */
+  const SHORT_URL_FORMATS_NATIVE = [
+    { prefix: 's', format: 'zstd' },
+    { prefix: 'b', format: 'brotli' },
+    { prefix: 'd', format: 'deflate-raw' },
+    { prefix: 'z', format: 'gzip' }
+  ];
+  const detectFormat = (Ctor, format) => {
     if (!compressionSupported) return false;
-    try { new CompressionStream('brotli'); return true; } catch (e) { return false; }
-  })();
-  const brotliDecompressSupported = (() => {
-    if (!compressionSupported) return false;
-    try { new DecompressionStream('brotli'); return true; } catch (e) { return false; }
-  })();
+    try { new Ctor(format); return true; } catch (e) { return false; }
+  };
+  const compressSupport = {};
+  const decompressSupport = {};
+  SHORT_URL_FORMATS_NATIVE.forEach(({ format }) => {
+    compressSupport[format] = detectFormat(CompressionStream, format);
+    decompressSupport[format] = detectFormat(DecompressionStream, format);
+  });
+  // 全候補（CompressionStream 系 + LZMA）。LZMA は実行時に CDN ロード後に使用可能。
+  const SHORT_URL_FORMATS_ALL = SHORT_URL_FORMATS_NATIVE.concat([{ prefix: 'l', format: 'lzma' }]);
+  // プレフィックス → format マップ。小文字 = 辞書なし(v1)、大文字 = 辞書あり(v2, A-3 適用)。
+  // 既存の v1 (`#b=...` 等) と互換性を保ちつつ、新規生成は最短採用方式で v1/v2 のどちらかになる。
+  const FORMAT_BY_PREFIX = {};
+  SHORT_URL_FORMATS_ALL.forEach(({ prefix, format }) => {
+    FORMAT_BY_PREFIX[prefix] = format;                  // v1: 辞書なし
+    FORMAT_BY_PREFIX[prefix.toUpperCase()] = format;    // v2: 辞書あり
+  });
+  /**
+   * 短縮URLのハッシュ部分を拾う正規表現（1文字プレフィックス + '=' + base64url）。
+   * プレフィックスは小文字 (`b`/`z`/`d`/`s`/`l`) または大文字 (`B`/`Z`/`D`/`S`/`L`)。
+   * 大文字 = 圧縮前に静的辞書置換 (A-3) を適用しているため、展開後に逆処理が必要。
+   */
+  const SHORT_URL_HASH_RE = /^([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
 
   /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
@@ -108,7 +159,9 @@
     const hasArtifact = !!currentHtml;
     exportBtns.forEach(b => { b.disabled = busy || !hasArtifact; });
     copyBtn.disabled = !!busy;
-    shortenBtn.disabled = !!busy || !hasArtifact || !compressionSupported;
+    // CompressionStream 非対応の古いブラウザでも LZMA-JS だけで動作可能なため、ここでは弾かない。
+    // 全形式が失敗した場合のみ compressHtml が throw してエラー表示になる。
+    shortenBtn.disabled = !!busy || !hasArtifact;
     if (!busy) hideProgress();
   };
 
@@ -128,19 +181,105 @@
   });
 
   // ============================================================
-  // 圧縮 / 展開（Copy Short URL 用）— Brotli 優先、未対応時は gzip にフォールバック
+  // HTML 前処理: A-1 ミニファイ + A-3 静的辞書置換
+  //   いずれも圧縮前のオプション処理。A-1 は表示上等価なので decoder 不要、
+  //   A-3 はプレフィックスが大文字の場合のみ逆処理を実行する。
   // ============================================================
+
   /**
-   * UTF-8 エンコード後のバイト列を指定形式で圧縮し base64url（URL安全）にまとめる。外部送信ゼロ。
-   * Brotli が使えればそちらを優先する（HTML系で gzip より 15〜25% 短くなる）。
-   * @returns  format: 'brotli' | 'gzip', payload: string 
+   * A-1: HTML ミニファイ。表示結果を変えない範囲で空白とコメントを削減する。
+   *   - HTML コメントを除去（条件付きコメント `<!--[if IE]>` は保持）
+   *   - 連続空白を 1 個のスペースに圧縮 / タグ境界の空白を除去
+   *   - <pre> / <textarea> / <script> / <style> / <code> の内部はユニークマーカーで退避して完全保護
    */
-  /** 単一形式で圧縮し base64url 文字列を返す内部関数 */
-  const compressWith = async (html, format) => {
-    const enc = new TextEncoder();
-    const stream = new Blob([enc.encode(html)]).stream().pipeThrough(new CompressionStream(format));
-    const buf = await new Response(stream).arrayBuffer();
-    const bytes = new Uint8Array(buf);
+  const minifyHtml = (html) => {
+    const PRESERVE_TAGS = ['pre', 'textarea', 'script', 'style', 'code'];
+    const preserved = [];
+    // ランダム生成のユニークなテキストマーカー（同一 HTML にそのマーカーがたまたま含まれる確率はゼロに近い）。
+    // 制御文字を使わず可読 ASCII のみで構成し、コンテントストレージシステムとの不適合を避ける。
+    const marker = 'UATPRES' + Math.random().toString(36).slice(2, 10) + 'X';
+    const preservedRe = new RegExp('<(' + PRESERVE_TAGS.join('|') + ')\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>', 'gi');
+    let work = html.replace(preservedRe, (match) => {
+      const token = marker + preserved.length + 'X';
+      preserved.push(match);
+      return token;
+    });
+    // HTML コメント除去（条件付きコメントは保持: 先頭が `[if` で始まるものは残す）
+    work = work.replace(/<!--([\s\S]*?)-->/g, (m, body) => /^\[if\b/i.test(body) ? m : '');
+    // 連続空白を 1 個に圧縮 / タグ境界の空白を除去 / 先頭末尾トリム
+    work = work.replace(/\s+/g, ' ').replace(/>\s+</g, '><').trim();
+    // ユニークマーカーを元に戻す
+    const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
+    work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
+    return work;
+  };
+
+  /**
+   * A-3: 静的辞書置換。HTML で頻出する長いトークン（`<!DOCTYPE html>` 等）を、
+   * NUL/TAB/LF/CR を避けた 0x01-0x1F の制御文字 1 バイトに置換する。decoder は同じテーブルで逆処理する。
+   * 元 HTML がいずれかのセンチネル文字を既に含んでいる場合は適用不可（dictCanApply で判定）。
+   * トークンは互いに部分一致しないように選定（split/join はメタ文字を気にせず確実に置換できる）。
+   */
+  const DICT_TOKENS = [
+    '<meta name="viewport" content="width=device-width,initial-scale=1.0">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<meta charset="UTF-8">',
+    '<meta charset="utf-8">',
+    '<!DOCTYPE html>',
+    '<!doctype html>',
+    '<html lang="ja">',
+    '<html lang="en">',
+    '</section>',
+    '</header>',
+    '</script>',
+    '<section ',
+    '<section>',
+    '<header>',
+    '<script>',
+    '</style>',
+    '</title>',
+    '</body>',
+    '</html>',
+    '<style>',
+    '<title>',
+    '<body>',
+    '<head>',
+    '</span>',
+    '</div>',
+    '</li>'
+  ];
+  const DICT_SENTINELS = (() => {
+    const arr = [];
+    for (let cc = 0x01; cc <= 0x1F && arr.length < DICT_TOKENS.length; cc++) {
+      if (cc === 0x09 || cc === 0x0A || cc === 0x0D) continue;
+      arr.push(String.fromCharCode(cc));
+    }
+    return arr;
+  })();
+  const DICT_PAIRS = DICT_TOKENS.slice(0, DICT_SENTINELS.length).map((tok, i) => [tok, DICT_SENTINELS[i]]);
+  const dictCanApply = (html) => {
+    for (const [, s] of DICT_PAIRS) if (html.indexOf(s) >= 0) return false;
+    return true;
+  };
+  const dictApply = (html) => {
+    let out = html;
+    for (const [tok, sen] of DICT_PAIRS) out = out.split(tok).join(sen);
+    return out;
+  };
+  const dictReverse = (html) => {
+    let out = html;
+    for (const [tok, sen] of DICT_PAIRS) out = out.split(sen).join(tok);
+    return out;
+  };
+
+  // ============================================================
+  // 圧縮 / 展開（Copy Short URL 用）
+  //   方針: HTML を A-1 ミニファイ → A-3 辞書ありなし両方トライ → 全形式 (zstd/brotli/deflate-raw/gzip/LZMA)
+  //         で並列圧縮 → 最短採用。プレフィックス小文字 = 辞書なし v1、大文字 = 辞書あり v2。
+  // ============================================================
+
+  /** Uint8Array → base64url（URL安全） */
+  const bytesToBase64Url = (bytes) => {
     let binary = '';
     const chunkSize = 0x8000;
     for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -148,55 +287,171 @@
     }
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   };
-
-  const compressHtml = async (html) => {
-    // 両対応環境では Brotli と gzip を両方試し、ペイロードが短い方を採用する。
-    // Brotli は固定オーバーヘッドがその分重く、超小HTMLや特殊な内容では gzip の方が短くなるケースをカバーする。
-    // 何らかの理由で一方が例外を投げた場合は黙ってスキップし、もう一方を採用する。
-    const formats = brotliCompressSupported ? ['brotli', 'gzip'] : ['gzip'];
-    const results = [];
-    for (const fmt of formats) {
-      try {
-        results.push({ format: fmt, payload: await compressWith(html, fmt) });
-      } catch (e) {
-        /* この形式はスキップ */
-      }
-    }
-    if (results.length === 0) throw new Error('compression failed for all available formats');
-    // 最短ペイロードを採用（同点は先頭=Brotli を優先）
-    return results.reduce((best, cur) => cur.payload.length < best.payload.length ? cur : best);
-  };
-
-  /** base64url 形式の圧縮ペイロードを復号して UTF-8 文字列に戻す。format は 'brotli' か 'gzip' */
-  const decompressHtml = async (format, b64url) => {
+  /** base64url → Uint8Array */
+  const base64UrlToBytes = (b64url) => {
     let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
     const pad = b64.length % 4;
     if (pad) b64 += '='.repeat(4 - pad);
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  /** UTF-8 エンコード → CompressionStream(format) → base64url。format は brotli/gzip/deflate-raw/zstd */
+  const compressWithStream = async (text, format) => {
+    const enc = new TextEncoder();
+    const stream = new Blob([enc.encode(text)]).stream().pipeThrough(new CompressionStream(format));
+    const buf = await new Response(stream).arrayBuffer();
+    return bytesToBase64Url(new Uint8Array(buf));
+  };
+  /** base64url → DecompressionStream(format) → UTF-8 文字列 */
+  const decompressWithStream = async (b64url, format) => {
+    const bytes = base64UrlToBytes(b64url);
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
     const buf = await new Response(stream).arrayBuffer();
     return new TextDecoder().decode(buf);
   };
 
+  /** LZMA-JS をラップした圧縮（callback → Promise）。mode 9 = 最大圧縮。 */
+  const compressLzma = async (text) => {
+    await loadScript(URLS.lzma);
+    if (!window.LZMA) throw new Error('LZMA library failed to load');
+    const out = await new Promise((resolve, reject) => {
+      window.LZMA.compress(text, 9, (result, err) => {
+        if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
+        // ワーカー異常や中断ケースで result が null/undefined になると、以前のコードでは
+        // result.length で TypeError が出て原因不明のエラーになっていたため、明示メッセージで reject。
+        if (!result || typeof result.length !== 'number') {
+          reject(new Error('LZMA compress returned no data'));
+          return;
+        }
+        // result は Int8Array または number[]。Uint8Array に正規化。
+        const bytes = new Uint8Array(result.length);
+        for (let i = 0; i < result.length; i++) bytes[i] = result[i] & 0xFF;
+        resolve(bytes);
+      });
+    });
+    return bytesToBase64Url(out);
+  };
+  /** LZMA-JS の展開。decompress 結果は string（UTF-8 デコード済み）。 */
+  const decompressLzma = async (b64url) => {
+    await loadScript(URLS.lzma);
+    if (!window.LZMA) throw new Error('LZMA library failed to load');
+    const bytes = base64UrlToBytes(b64url);
+    const arr = Array.from(bytes); // LZMA.decompress は Array<number> または Int8Array を受け取る
+    return await new Promise((resolve, reject) => {
+      window.LZMA.decompress(arr, (result, err) => {
+        if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
+        // result が null/undefined のとき String(result) は "null"/"undefined" という文字列になるため
+        // 明示エラーとして reject し、それを HTML として描画してしまう事故を防ぐ。
+        if (result === null || result === undefined) {
+          reject(new Error('LZMA decompress returned no data'));
+          return;
+        }
+        resolve(typeof result === 'string' ? result : String(result));
+      });
+    });
+  };
+
+  /** format 別の圧縮ディスパッチャ。戻り値: base64url ペイロード文字列。失敗時は throw。 */
+  const compressByFormat = async (text, format) => {
+    if (format === 'lzma') return compressLzma(text);
+    return compressWithStream(text, format);
+  };
+  /** format 別の展開ディスパッチャ。戻り値: UTF-8 文字列。 */
+  const decompressByFormat = async (b64url, format) => {
+    if (format === 'lzma') return decompressLzma(b64url);
+    return decompressWithStream(b64url, format);
+  };
+
+  /**
+   * Copy Short URL の本体。HTML を A-1 ミニファイし、A-3 辞書ありなし × 全形式（最大 5 種 × 2 = 10 候補）を
+   * 並列に試行して最短ペイロードを選ぶ。
+   * 戻り値: { format, prefix, dict, payload, preprocessedSize }
+   */
+  const compressHtml = async (html) => {
+    const minified = minifyHtml(html);
+    const variants = [{ html: minified, dict: false }];
+    if (dictCanApply(minified)) {
+      variants.push({ html: dictApply(minified), dict: true });
+    }
+    // 実環境で対応している CompressionStream 系 + 常に試す LZMA
+    const formats = [
+      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]),
+      { prefix: 'l', format: 'lzma' }
+    ];
+    if (formats.length === 0) throw new Error('no compression formats are available');
+    const trials = [];
+    for (const v of variants) {
+      for (const f of formats) {
+        trials.push({ html: v.html, dict: v.dict, format: f.format, prefix: f.prefix });
+      }
+    }
+    const settled = await Promise.all(trials.map(async (t) => {
+      try {
+        const payload = await compressByFormat(t.html, t.format);
+        const prefix = t.dict ? t.prefix.toUpperCase() : t.prefix;
+        return { format: t.format, prefix, dict: t.dict, payload, preprocessedSize: t.html.length };
+      } catch (e) {
+        return null;
+      }
+    }));
+    const results = settled.filter(Boolean);
+    if (results.length === 0) throw new Error('compression failed for all available formats');
+    // 最短ペイロードを採用（同点は trials の挿入順: dict なし→あり、形式は zstd→brotli→deflate-raw→gzip→LZMA）
+    return results.reduce((best, cur) => cur.payload.length < best.payload.length ? cur : best);
+  };
+
+  /**
+   * format + base64url + dictApplied から UTF-8 HTML を復元する。
+   * dictApplied=true（v2 大文字プレフィックス）のときのみ A-3 辞書を逆処理する。
+   * A-1 ミニファイは表示上等価なので逆処理不要。
+   */
+  const decompressHtml = async (format, b64url, dictApplied) => {
+    const text = await decompressByFormat(b64url, format);
+    return dictApplied ? dictReverse(text) : text;
+  };
+
   // ============================================================
   // Lazy library loader
   // ============================================================
+  // タイムアウトを設定して、CDN がハングした場合に await loadScript() が永遠に
+  // 解決されず、エクスポートボタンが busy のまま固まる事故を防ぐ。
+  // 30 秒でも load も error も発火しない場合は明示エラーで reject、
+  // _loaded の cache を delete してリトライ可能な状態に戻す。
   const _loaded = {};
+  const SCRIPT_LOAD_TIMEOUT_MS = 30000;
   const loadScript = (url) => _loaded[url] || (_loaded[url] = new Promise((res, rej) => {
     const s = document.createElement('script');
+    let done = false;
+    let timer = 0;
+    const finish = (ok, err) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (ok) res();
+      else { delete _loaded[url]; rej(err); }
+    };
     s.src = url;
     s.async = true;
-    s.onload = () => res();
-    s.onerror = () => { delete _loaded[url]; rej(new Error('Failed to load library: ' + url)); };
+    s.onload = () => finish(true);
+    s.onerror = () => finish(false, new Error('Failed to load library: ' + url));
+    timer = setTimeout(
+      () => finish(false, new Error('Library load timed out (' + (SCRIPT_LOAD_TIMEOUT_MS / 1000) + 's): ' + url)),
+      SCRIPT_LOAD_TIMEOUT_MS
+    );
     document.head.appendChild(s);
   }));
   const URLS = {
     html2canvas: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
     jspdf:       'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
     pptxgen:     'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js',
-    jszip:       'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'
+    jszip:       'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+    // LZMA-JS 2.3.2 (pure-JS LZMA1 圧縮/展開)。Copy Short URL でブラウザ内蔵 CompressionStream
+    // (zstd / Brotli / deflate-raw / gzip) と並列に試行し最短ペイロードを採用する。worker版は
+    // window.LZMA グローバルに Web Worker を内部生成 (Blob URL)。約85KB minified、外部送信ゼロ。
+    lzma:        'https://cdn.jsdelivr.net/npm/lzma@2.3.2/src/lzma_worker-min.js'
   };
 
   // ============================================================
@@ -244,6 +499,81 @@
     }
   };
 
+  // ============================================================
+  // 内部アンカー (TOC リンク) の親ナビゲーション抑止
+  //   AI 生成アーティファクトの目次が <a href="#math"> のようなフラグメントリンクを
+  //   <base target="_top"> や parent.location 経由で親ウィンドウに伝播させてしまうと、
+  //   ビューアは "math" を新しい HTML として解釈してしまう。これを防ぐため、
+  //     (1) iframe 内 click を capture phase で横取りして preventDefault し、iframe 内
+  //         scrollIntoView に振り替える (Layer 1)、
+  //     (2) それでも親 hash が書き換わってしまった場合は、iframe 内に該当 id を持つ要素が
+  //         存在する短い hash を「アンカークリックの副作用」とみなして再描画せず URL を戻す
+  //         (Layer 2)、
+  //   の二段構えで防御する。Layer 2 は実在 id 判定を伴うため、新しいアーティファクトを
+  //   ハッシュ経由で開く通常用途は妨げない。
+  // ============================================================
+
+  /** 直近で描画したコンテンツの hash 文字列（# を除いた raw 値）。Layer 2 のアンカー判定に使う */
+  let lastContentHash = '';
+
+  /**
+   * hash がアンカークリック由来っぽいかを判定する。判断材料：
+   *   - 圧縮 URL (`b=...` 等) ではない
+   *   - 長すぎない（150文字以下）
+   *   - 既にコンテンツが表示されている (currentHtml 非空)
+   *   - iframe 内に decodeURIComponent(hash) と同じ id を持つ要素が実在する
+   *  全てを満たすときのみ true を返すため、誤検出（実コンテンツをアンカーと誤認）が起きにくい。
+   */
+  const isAnchorLikeHash = (h) => {
+    if (!h) return false;
+    if (h.length > 150) return false;
+    if (SHORT_URL_HASH_RE.test(h)) return false;
+    if (!currentHtml) return false;
+    const idoc = frame.contentDocument;
+    if (!idoc) return false;
+    try {
+      const decoded = decodeURIComponent(h);
+      return !!idoc.getElementById(decoded);
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /**
+   * iframe 内 click を capture phase で横取りし、フラグメントリンク `<a href="#...">` の
+   * 既定動作を抑止して iframe 内 scrollIntoView に振り替える。
+   * `<base target="_top">` 等で親ウィンドウへ伝播する設定でも preventDefault でナビゲーション
+   * ごと止められる。修飾キー付きクリック・中クリックはブラウザ既定 (新規タブ等) に任せる。
+   */
+  const attachAnchorInterceptor = () => {
+    const idoc = frame.contentDocument;
+    if (!idoc) return;
+    idoc.addEventListener('click', (e) => {
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const a = e.target && e.target.closest && e.target.closest('a[href]');
+      if (!a) return;
+      const href = a.getAttribute('href');
+      if (!href || href.charAt(0) !== '#') return;
+      // 既定動作（ナビゲーション）のみ抑止する。stopPropagation は呼ばない —
+      // アーティファクト独自の click ハンドラ (ハイライト切替、ログ収集、タブ切り替え等)
+      // を妨げないため。preventDefault だけでフラグメントナビゲーションは確実に止まる。
+      e.preventDefault();
+      const id = href.slice(1);
+      const iwin = frame.contentWindow || idoc.defaultView;
+      if (!id) {
+        try { if (iwin) iwin.scrollTo(0, 0); } catch (err) {}
+        return;
+      }
+      try {
+        const decoded = decodeURIComponent(id);
+        const target = idoc.getElementById(decoded);
+        if (target && typeof target.scrollIntoView === 'function') {
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      } catch (err) { /* ignore */ }
+    }, true);
+  };
+
   // hashchange の連続発火に備えて、render の最新世代だけが描画を反映するようにする
   let renderSeq = 0;
   /** location.hash からHTMLを取り出してフレームに反映（`#z=...` は gzip 圧縮されたペイロード） */
@@ -257,29 +587,46 @@
       document.title = 'Artifact Viewer';
       frame.srcdoc = renderEmptyState();
       setStatus('');
+      lastContentHash = '';
       setBusy(false);
       return;
     }
     let html;
-    // `#b=<base64url>` は Brotli、`#z=<base64url>` は gzip で圧縮されたHTML（Copy Short URL で生成）
-    const compressedMatch = raw.match(/^([bz])=([A-Za-z0-9_-]+)$/);
+    // `#<prefix>=<base64url>` は圧縮されたHTML（Copy Short URL で生成）。
+    //   小文字 (v1, 辞書なし): s=zstd / b=Brotli / d=deflate-raw / z=gzip / l=LZMA
+    //   大文字 (v2, 辞書あり): S/B/D/Z/L  ← 展開後に A-3 辞書を逆処理する
+    const compressedMatch = raw.match(SHORT_URL_HASH_RE);
     if (compressedMatch) {
-      const fmt = compressedMatch[1] === 'b' ? 'brotli' : 'gzip';
+      const prefixChar = compressedMatch[1];
+      const fmt = FORMAT_BY_PREFIX[prefixChar];
+      const dictApplied = (prefixChar === prefixChar.toUpperCase());
       const payload = compressedMatch[2];
-      const supported = compressionSupported && (fmt === 'gzip' || brotliDecompressSupported);
-      if (!supported) {
+      // LZMA は CDN ロード後に常に動く前提。CompressionStream 系のみブラウザ非対応の可能性がある。
+      const isStreamFmt = (fmt !== 'lzma');
+      if (isStreamFmt && (!compressionSupported || !decompressSupport[fmt])) {
         if (mySeq !== renderSeq) return;
-        const reason = fmt === 'brotli'
-          ? 'this URL uses Brotli; please open in Chrome 144+ / Firefox 147+ / Safari 19+'
-          : 'compressed payload requires a modern browser (CompressionStream)';
-        setStatus(reason);
+        const reasons = {
+          brotli: 'this URL uses Brotli; please open in Chrome 144+ / Firefox 147+ / Safari 19+',
+          zstd: 'this URL uses zstd; please open in a browser whose CompressionStream API supports zstd (currently Firefox 149+)',
+          'deflate-raw': 'this URL uses deflate-raw; please use a modern browser',
+          gzip: 'compressed payload requires a modern browser (CompressionStream)'
+        };
+        // currentHtml と タイトルを空状態に揃える。これをしないと「古いアーティファクトが
+        // currentHtml に残ったまま PNG / PDF / PPTX エクスポートボタンが有効化され、空の empty state を
+        // キャプチャしてしまう」事故が起きる。lastContentHash も現 URL に揃え、同一 hash の
+        // hashchange が再びエラー処理を走らせないようにする。
+        currentHtml = '';
+        titleEl.textContent = 'Artifact Viewer';
+        document.title = 'Artifact Viewer';
+        setStatus(reasons[fmt] || ('this URL uses ' + fmt + '; not supported on this browser'));
         frame.srcdoc = renderEmptyState();
+        lastContentHash = raw;
         setBusy(false);
         return;
       }
-      setStatus('decompressing (' + fmt + ')...');
+      setStatus('decompressing (' + fmt + (dictApplied ? '+dict' : '') + ')...');
       try {
-        html = await decompressHtml(fmt, payload);
+        html = await decompressHtml(fmt, payload, dictApplied);
       } catch (e) {
         if (mySeq !== renderSeq) return;
         setStatus('decompress failed: ' + (e && e.message ? e.message : e));
@@ -296,7 +643,11 @@
     // ブラウザタブにも反映（複数タブで区別しやすくする）
     document.title = ttl + ' — Artifact Viewer';
     frame.srcdoc = html;
-    setStatus(formatBytes(html.length));
+    // html.length は UTF-16 コードユニット数で、日本語など多バイト文字を含むアーティファクトでは
+    // 実際の UTF-8 バイト数の約 1/3 になる (例: 300 KB の URL が 「100 KB」と表示)。
+    // Blob サイズで正確な UTF-8 バイト数を取る。
+    setStatus(formatBytes(new Blob([html]).size));
+    lastContentHash = raw;
     setBusy(false);
   };
 
@@ -484,10 +835,39 @@
   // Editable PPTX (Marpit) — extracts native PPTX text/image/table from DOM
   // ============================================================
 
-  /** rgb()/rgba()文字列を 'RRGGBB' に変換。透明はnull */
+  /**
+   * 任意の CSS 色文字列を 'RRGGBB' に変換する。透明 (alpha < 0.05) は null。
+   * rgb / rgba は直接パースし、それ以外（oklch / lch / hsl / hwb / color() / hex /
+   * 名前付きカラーなど）は canvas の fillStyle 正規化を介して rgb 文字列に揃えてから
+   * 再パースする。これにより Tailwind CSS 4 などが既定で出力する oklch カラーも PPTX に
+   * 反映される。以前は rgb() 以外をすべて null 扱いにしていたため、モダンアーティファクトで
+   * PPTX の色が一斉に拜える事故が起きる。
+   */
+  const _colorNormCanvas = (() => {
+    try { return document.createElement('canvas').getContext('2d'); }
+    catch (e) { return null; }
+  })();
+  const RGB_RE = /^rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*([\d.]+))?\)$/;
   const cssColorToHex = (color) => {
     if (!color) return null;
-    const m = String(color).match(/^rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*([\d.]+))?\)$/);
+    const s = String(color);
+    let m = s.match(RGB_RE);
+    if (!m && _colorNormCanvas) {
+      try {
+        // 不正な色文字列が代入されたときに前回値が残ると「不正」を「センチネル色」と誤認
+        // してしまうため、代入前に実コードでほぼ使われないセンチネルを置いて検出する。
+        _colorNormCanvas.fillStyle = '#01020a';
+        _colorNormCanvas.fillStyle = s;
+        const norm = String(_colorNormCanvas.fillStyle);
+        if (norm !== '#01020a') {
+          m = norm.match(RGB_RE);
+          if (!m) {
+            const hexm = norm.match(/^#([0-9a-fA-F]{6})$/);
+            if (hexm) return hexm[1].toUpperCase();
+          }
+        }
+      } catch (e) { /* canvas 非対応・色解析失敗時は null フォールバック */ }
+    }
     if (!m) return null;
     const a = m[4] === undefined ? 1 : parseFloat(m[4]);
     if (a < 0.05) return null;
@@ -512,8 +892,18 @@
     const clampFontPt = (v) => Math.max(6, Math.min(96, v));
     const walk = (node, ctx) => {
       if (node.nodeType === 3) {
-        const t = node.textContent;
-        if (t && t.length > 0) runs.push({ text: t, options: Object.assign({}, ctx) });
+        // HTML の空白圧縮ルールに合わせ、改行・連続空白を 1 個のスペースに畳む。
+        // これをしないと `<h1>foo</h1>\n<p>bar</p>` の `\n` がランとして PPTX に輸出され、
+        // 見出し前後に記述可能なデカい余白が出る。また、空白のみのランは、直前のランが
+        // 既に空白で終わっている・改行 (breakLine) になっているときは捨てる。
+        let t = node.textContent;
+        if (!t) return;
+        t = t.replace(/\s+/g, ' ');
+        if (t === ' ') {
+          const prev = runs[runs.length - 1];
+          if (!prev || (prev.text && /\s$/.test(prev.text)) || prev.options.breakLine) return;
+        }
+        runs.push({ text: t, options: Object.assign({}, ctx) });
         return;
       }
       if (node.nodeType !== 1) return;
@@ -524,7 +914,10 @@
         return;
       }
       const cs = win.getComputedStyle(node);
-      if (cs.display === 'none' || cs.visibility === 'hidden') return;
+      // opacity=0 で隠している要素 (Tailwind の `opacity-0` クラス、トースト、ツールチップ等)
+      // も PPTX には出さないようスキップする。これをしないとタッチダウンやホバー表示の
+      // テキストがスライド本体に紛れ込む。
+      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return;
       // ブロックレベル要素の前にbreakLineを挿入（連続テキストを行で区切る、ルートはruns=0で自然にスキップ）
       if (!isInlineDsp(cs.display) && runs.length > 0 && !runs[runs.length - 1].options.breakLine) {
         runs[runs.length - 1].options = Object.assign({}, runs[runs.length - 1].options, { breakLine: true });
@@ -626,13 +1019,15 @@
       const pushImgs = (el) => {
         Array.from(el.querySelectorAll('img')).forEach((img) => {
           const imgCs = win.getComputedStyle(img);
-          if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden') leaves.push(img);
+          // 上記同様 opacity=0 も隠し扱いとしてスキップ。
+          if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden' && parseFloat(imgCs.opacity) !== 0) leaves.push(img);
         });
       };
       const visit = (el) => {
         if (!el || el.nodeType !== 1) return;
         const cs = win.getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden') return;
+        // opacity=0 要素もスキップして PPTX にゴースト要素が出ないようにする。
+        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return;
         const tag = el.tagName;
         if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
         if (HANDLED.indexOf(tag) >= 0) {
@@ -653,7 +1048,7 @@
         const textOrImageChildren = Array.from(el.children).filter(c => {
           if (c.nodeType !== 1) return false;
           const ccs = win.getComputedStyle(c);
-          if (ccs.display === 'none' || ccs.visibility === 'hidden') return false;
+          if (ccs.display === 'none' || ccs.visibility === 'hidden' || parseFloat(ccs.opacity) === 0) return false;
           if (c.tagName === 'IMG') return true;
           const ct = c.textContent && c.textContent.trim();
           return !!ct || !!c.querySelector('img');
@@ -967,7 +1362,9 @@
       pptx.layout = 'LAYOUT_WIDE'; // 13.333 x 7.5 inches (16:9)
 
       // 編集可能パスの判定: reveal.jsでなく、複数の<section>がbody直下/.marpit直下/main直下にあるか
-      const hasReveal = win.Reveal && typeof win.Reveal.slide === 'function';
+      // win が null/undefined のケース（iframe が同期的に破棄された・クロスオリジン遷移等）
+      // を防ぐため win 自身の null チェックを加える。
+      const hasReveal = win && win.Reveal && typeof win.Reveal.slide === 'function';
       let editableSections = null;
       if (!hasReveal) {
         for (const sel of ['body > section', '.marpit > section', 'main > section']) {
@@ -1023,7 +1420,7 @@
     try {
       let url = location.href;
       const raw = location.hash.slice(1);
-      const isCompressed = /^([bz])=[A-Za-z0-9_-]+$/.test(raw);
+      const isCompressed = SHORT_URL_HASH_RE.test(raw);
       if (isCompressed && currentHtml) {
         // AGENTS のルールに従い、HTML 中の `#` のみ %23 にエスケープする。
         // その他の特殊文字（< > " 等）はブラウザがアドレスバー表示上で自動エンコードし、
@@ -1040,34 +1437,48 @@
   };
 
   /**
-   * 現在のアーティファクトを Brotli（未対応時は gzip）で圧縮し、`#b=...` または `#z=...` 形式の
-   * 短縮URLとしてクリップボードへコピーする。Brotli は HTML/CSS/JS で gzip より 15〜25% 短くなる。
-   * 外部サービスへの送信は一切行わず、ブラウザ内蔵の CompressionStream API のみ使用する。
-   * 圧縮率は内容に依存するが、典型的には元の25〜45%（Brotli）/ 30〜50%（gzip）。
+   * 現在のアーティファクトを A-1 ミニファイ + A-3 辞書置換（試行のみ）で前処理した上で、
+   * 全圧縮形式（zstd / Brotli / deflate-raw / gzip / LZMA）× 辞書ありなしを並列に試行し、
+   * 最短ペイロードを採用した短縮URLをクリップボードにコピーする。
+   * 出力プレフィックスは小文字 (v1, 辞書なし) / 大文字 (v2, 辞書あり) で表現する：
+   *   `#s=` zstd / `#b=` Brotli / `#d=` deflate-raw / `#z=` gzip / `#l=` LZMA
+   *   `#S=` / `#B=` / `#D=` / `#Z=` / `#L=` は同形式の辞書あり版。
+   * 同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA。
+   * 外部サービスへの送信は一切行わない（CompressionStream API + LZMA-JS 同梱ライブラリのみ）。
+   * 圧縮率は内容に依存するが、典型的には元の 18〜35%（前処理 + 最良形式）。
    */
   const copyShortUrl = async () => {
     if (!currentHtml) {
       setStatus('No artifact to compress');
       return;
     }
-    if (!compressionSupported) {
-      setStatus('CompressionStream is not supported on this browser');
-      return;
-    }
+    // 圧縮処理中に hashchange でアーティファクトが切り替わると、クリップボードに入る
+    // URL は「クリック時に見ていたコンテンツ」だが、ステータス表示は「現在のコンテンツ」を
+    // 分母にしてスケールが狂うので、圧縮入力をローカルに固定し、完了時に整合性を検査
+    // して食い違いを検出したらクリップボードへの書き込みを中止する。
+    const sourceHtml = currentHtml;
     setBusy(true);
     setStatus('compressing...');
     try {
-      const { format, payload } = await compressHtml(currentHtml);
-      const prefix = format === 'brotli' ? '#b=' : '#z=';
-      const shortUrl = location.origin + location.pathname + prefix + payload;
-      const originalLen = location.href.length;
+      const { format, prefix, dict, payload } = await compressHtml(sourceHtml);
+      if (sourceHtml !== currentHtml) {
+        setStatus('artifact changed during compression — please retry');
+        return;
+      }
+      const shortUrl = location.origin + location.pathname + '#' + prefix + '=' + payload;
+      // 圧縮率の分母は「現在の URL 長」ではなく「ソース HTML をそのまま埋めた
+      // 標準形 URL 長」とする。これにより、すでに圧縮 URL で開いている状態でも
+      // 「本来の元 URL に対して何 % に縮んだか」が一貫して表示される。
+      const baselineUrl = location.origin + location.pathname + '#' + sourceHtml.replace(/#/g, '%23');
+      const baselineLen = baselineUrl.length;
       const newLen = shortUrl.length;
-      const ratio = originalLen > 0 ? Math.round((newLen / originalLen) * 100) : 0;
+      const ratio = baselineLen > 0 ? Math.round((newLen / baselineLen) * 100) : 0;
       await navigator.clipboard.writeText(shortUrl);
       const original = shortenBtn.textContent;
       shortenBtn.textContent = 'Copied';
       setTimeout(() => { shortenBtn.textContent = original; }, 1500);
-      setStatus('Short URL copied (' + format + ', ' + formatBytes(originalLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
+      const tag = format + (dict ? '+dict' : '');
+      setStatus('Short URL copied (' + tag + ', ' + formatBytes(baselineLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
     } catch (e) {
       setStatus('shorten failed: ' + (e && e.message ? e.message : e));
     } finally {
@@ -1078,7 +1489,42 @@
   // ============================================================
   // Events
   // ============================================================
-  window.addEventListener('hashchange', render);
+  // iframe srcdoc が再読込みされるたびに新しい contentDocument に対して anchor interceptor を再装着する
+  // 永続的な単一リスナー。render() の連続呼び出しで once リスナーが多重登録され、同一 doc に
+  // interceptor が複数効いて 1 クリックで N 回 scrollIntoView してしまう事故を防ぐため、
+  // once ではなく永続として 1 個だけ貼る。
+  frame.addEventListener('load', () => attachAnchorInterceptor());
+
+  // hashchange は通常 render を呼ぶが、iframe 内アンカーリンクが何らかの経路で親 URL を
+  // 書き換えてしまった場合 (<base target="_top"> 付き AI 生成 HTML、parent.location.hash の
+  // 直書き等) に、その短い hash を新しい HTML として解釈し直して画面が壊れる事故を防ぐため、
+  // iframe 内に該当 id を持つ要素が実在する短い hash は再描画せず URL を元に戻して
+  // iframe 内スクロールに振り替える。実在 id 判定を伴うので、別アーティファクトをハッシュで
+  // 開く通常用途は妨げない。
+  window.addEventListener('hashchange', () => {
+    const newHash = location.hash.slice(1);
+    if (newHash === lastContentHash) return;
+    if (isAnchorLikeHash(newHash)) {
+      try {
+        const restored = location.pathname + location.search + (lastContentHash ? '#' + lastContentHash : '');
+        history.replaceState(null, '', restored);
+      } catch (e) { /* ignore */ }
+      const idoc = frame.contentDocument;
+      if (idoc) {
+        try {
+          const id = decodeURIComponent(newHash);
+          const target = idoc.getElementById(id);
+          if (target && typeof target.scrollIntoView === 'function') {
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        } catch (e) { /* ignore */ }
+      }
+      return;
+    }
+    // render が何らかの理由で reject した場合 (srcdoc 設定失敗、デコード中の予期しない
+    // 例外など) に unhandled rejection を出さず、ステータスにエラーを表示してユーザーに伝える。
+    render().catch(e => setStatus('render failed: ' + (e && e.message ? e.message : e)));
+  });
 
   exportBtns.forEach(btn => {
     btn.addEventListener('click', async () => {
@@ -1099,7 +1545,12 @@
   shortenBtn.addEventListener('click', copyShortUrl);
 
   // === Initial render ===
-  render();
+  // 初期 render の unhandled rejection もステータスに表示してサイレント失敗を防ぐ。
+  render().catch(e => setStatus('init failed: ' + (e && e.message ? e.message : e)));
+
+  // LZMA-JS をバックグラウンドで先読みしておく（初回 Copy Short URL クリック時の待ち時間を削減）。
+  // 失敗してもサイレントに無視する（compressLzma 内で同じ loadScript が必要時に再試行されるため）。
+  loadScript(URLS.lzma).catch(() => {});
 })();
 </script>
 </body>

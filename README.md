@@ -15,7 +15,7 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
     - PDF  — スライド検出時は1スライド=1ページ、単一アーティファクトは縦横比からA4の向きを自動選択し長辺方向にページ分割します（縦長い記事も横長いダッシュボードも対応、jsPDF）
     - PPTX — Marpit形式の `<section>` ベースのスライドは**編集可能なネイティブPPTX**として出力します（見出し・段落・箇条書き・表・画像が個別のPowerPoint要素として配置され、文字編集・検索・読み上げが可能です）。reveal.js / `<hr>` 区切り / 自由構造の場合は画像貼り付けのフォールバックになります（pptxgenjs）
 - Copy URL ボタンで現在URLをクリップボードにコピーできます。圧縮URL（`#b=...` / `#z=...`）で開いている場合は、展開後の生HTMLを `#` 以降にそのまま埋めた「非圧縮の元URL」を生成してコピーします（AIに読ませたり、デコードして中身を見たい場合に便利です）
-- Copy Short URL ボタンで、現在のアーティファクトを圧縮した短縮URLとしてクリップボードにコピーできます。Brotli 対応ブラウザでは Brotli と gzip の両方で圧縮を試行し、ペイロードが短い方を採用します（同点なら Brotli を優先）。出力形式は採用された圧縮で決まり、Brotli は `#b=<base64url>` 形式、gzip は `#z=<base64url>` 形式になります。Brotli 非対応ブラウザでは gzip のみが使われます。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API のみで動作します。圧縮率は内容に依存しますが、Brotli では元URLの25〜45%程度、gzip では30〜50%程度です（HTML/CSS/JS では通常 Brotli が gzip より 15〜25% 短くなりますが、超小HTMLなどでは固定オーバーヘッドの関係で gzip の方が短くなるケースがあるため、両方試して短い方を採用します）
+- Copy Short URL ボタンで、現在のアーティファクトを圧縮した短縮URLとしてクリップボードにコピーできます。圧縮前に **A-1 ミニファイ**（HTML から不要な空白とコメントを削除、表示は等価）を適用し、さらに **A-3 静的辞書置換**（`<!DOCTYPE html>` `<meta charset="UTF-8">` 等の頻出トークンを 1 バイトの制御文字に置換）を適用したものとしないものの両方を試行します。その上で **5 種の圧縮形式**（zstd / Brotli / deflate-raw / gzip / **LZMA**）と並列に組み合わせ、合計最大 10 候補のうちペイロードが最短になったものを採用します（同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA）。出力形式は採用された組み合わせで決まり、小文字プレフィックスが辞書なし版（`#s=` zstd / `#b=` Brotli / `#d=` deflate-raw / `#z=` gzip / `#l=` LZMA）、大文字プレフィックスが辞書あり版（`#S=` / `#B=` / `#D=` / `#Z=` / `#L=`）です。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API と CDN ロードする LZMA-JS（pure-JS、約 85 KB）のみで動作します。圧縮率は内容に依存しますが、典型的には元URLの **18〜35%程度**（前処理 + 最良形式）まで縮みます
 - `hashchange` イベントに対応しており、URL書き換えで即反映されます（リロード不要）
 - 多スライド・多ページ処理中はツールバーに進捗バーを表示します
 
@@ -110,12 +110,22 @@ iframe の sandbox 属性には以下のトークンを付与しています：
     - **画像フォールバック**（reveal.js / `<hr>` 区切り / 自由構造）：html2canvas で各スライドをPNG化して貼り付けます。見た目は元のCSSをそのまま再現しますが、PowerPoint上での文字編集はできません
     - 用途別の使い分けの目安：レイアウト fidelity を最優先したい（グラデーション背景・複雑な装飾を再現したい）場合は `<hr>` 区切りや reveal.js を使って画像フォールバックに倒す、文字を後から編集したい場合は `<section>` 構造に倒す、と方針を分けると安定します
 - PPTX はプレゼンでないアーティファクトも 1 スライドの画像として出力可能ですが、スライド形状の都合で縦長コンテンツは小さく見えるため、長尺は PDF を推奨します
+- **アーティファクト内のフラグメントリンク（目次・脚注等）の取り扱い**：AI が生成した HTML に `<a href="#math">` のような目次リンクが含まれていると、過去には iframe 内のクリックがビューア親ウィンドウの URL を書き換えてしまい、`#math` という短い hash を新しい HTML として解釈し直して「math だけが表示される」事故が起きていました。現在は二段構えで防御しています：
+    - **Layer 1**：iframe document の click を capture phase で横取りし、`<a href="#...">` の既定動作を `preventDefault()` で抑止して iframe 内 `scrollIntoView({behavior:'smooth'})` に振り替えます。`<base target="_top">` を含む AI 生成 HTML でもナビゲーションごと止まります。修飾キー付きクリック (Ctrl/Cmd/Shift/Alt) と中クリックはブラウザ既定 (新規タブで開く等) に任せます
+    - **Layer 2**：それでも親 URL が書き換わったケース（JS で `parent.location.hash` を直接書き換える HTML 等）に備え、`hashchange` イベントで「iframe 内に該当 id を持つ要素が実在する短い hash」は再描画せず `history.replaceState` で元の URL に戻して iframe 内スクロールにフォールバックします。実在 id 判定を伴うため、別アーティファクトをハッシュ経由で開く通常用途は妨げません
 - CDN が落ちている時は PNG / PDF / PPTX エクスポートが失敗します（HTMLエクスポートはオフラインでも動作します）
 - URL長上限を超える大規模アーティファクトは Gist 連携等の別経路が必要です
 - `navigator.clipboard.writeText` は HTTPS / localhost 上でのみ動作します（GitHub PagesはHTTPSなので問題ありません）
-- Copy Short URL はブラウザ内蔵の `CompressionStream` / `DecompressionStream` API を使用します。生成側は Brotli 対応環境では Brotli と gzip の両方で圧縮を試行し、出力ペイロードが短い方を採用します（同点なら Brotli を優先）。Brotli 非対応環境では gzip のみが使われます。形式と対応ブラウザは以下のとおりです
-    - Brotli (`#b=...` 形式)：Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+
-    - gzip (`#z=...` 形式)：Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+
-    - 受信側のブラウザが Brotli 非対応で `#b=...` URL を開いた場合は、対応ブラウザで開くよう案内するエラー表示になります
-    - 圧縮率は内容に依存しますが、典型的には元の25〜45%（Brotli）/ 30〜50%（gzip）です。バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません
-    - 短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません
+- Copy Short URL の圧縮パイプライン詳細
+    - **A-1 HTML ミニファイ**（常時適用、表示等価）：HTML コメントを除去し、連続空白を 1 個のスペースに圧縮し、タグ境界の空白を除去します。`<pre>` / `<textarea>` / `<script>` / `<style>` / `<code>` の内部はホワイトスペースを完全保護するため、コードハイライトや整形済みテキストは壊れません。条件付きコメント（`<!--[if IE]>`）は保持します
+    - **A-3 静的辞書置換**（試行のみ、決定的に有利な場合のみ採用）：`<!DOCTYPE html>` `<meta charset="UTF-8">` `<meta name="viewport" ...>` `</section>` `</script>` `<head>` `</head>` `<body>` `</body>` `</html>` 等の HTML 頻出トークン約 26 種類を、NUL/TAB/LF/CR を避けた 0x01〜0x1F の制御文字 1 バイトに置換します。元 HTML がいずれかの制御文字を既に含んでいる場合は適用不可（その場合は dict なし版のみ採用）。decoder は同じテーブルで逆処理します
+    - **圧縮形式は 5 種を並列試行**：CompressionStream 系（zstd / Brotli / deflate-raw / gzip）と LZMA-JS（CDN 遅延ロード）を、A-3 辞書ありなしと組み合わせて最大 10 候補を `Promise.all` で並列圧縮し、出力ペイロードが最短になったものを採用します。同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA
+    - 形式と対応ブラウザ
+        - zstd (`#s=` / `#S=` 形式)：CompressionStream API としては現状 Firefox 149+ のみ対応。zstd の HTTP コンテンツエンコーディング対応とは別物で、Chrome / Safari / Edge は未対応です
+        - Brotli (`#b=` / `#B=` 形式)：Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+
+        - deflate-raw (`#d=` / `#D=` 形式)：全主要ブラウザ（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）。gzip と同じ DEFLATE 圧縮だがヘッダ・チェックサムが無いため、同じ内容なら常に gzip より約 18 バイト短くなります
+        - gzip (`#z=` / `#Z=` 形式)：全主要ブラウザ（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
+        - **LZMA** (`#l=` / `#L=` 形式)：LZMA-JS（pure-JS、約 85 KB minified）を CDN（jsDelivr）から遅延ロードして使用。CompressionStream に依存しないため、対応ブラウザは実質すべてのモダンブラウザ。HTML/CSS/JS で Brotli より 5〜15% 縮むことがありますが、圧縮時間は数秒オーダーになることがあります（圧縮レベル 9 = 最大圧縮）
+    - 受信側のブラウザが該当形式を未対応の状態でそのURLを開いた場合は、形式ごとに対応ブラウザを案内するエラー表示になります（LZMA URL は LZMA-JS が読めれば全ブラウザで開けます）
+    - 圧縮率は内容に依存しますが、典型的には元の **18〜35% 程度**（前処理 + 最良形式の組み合わせ）まで縮みます。バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません
+    - 短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません。LZMA-JS のロードのみ jsDelivr CDN への HTTP リクエストが発生しますが、コード本体のダウンロード以外の通信は行いません
