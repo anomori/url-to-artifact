@@ -15,7 +15,7 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
     - PDF  — スライド検出時は1スライド=1ページ、単一アーティファクトは縦横比からA4の向きを自動選択し長辺方向にページ分割します（縦長い記事も横長いダッシュボードも対応、jsPDF）
     - PPTX — Marpit形式の `<section>` ベースのスライドは**編集可能なネイティブPPTX**として出力します（見出し・段落・箇条書き・表・画像が個別のPowerPoint要素として配置され、文字編集・検索・読み上げが可能です）。reveal.js / `<hr>` 区切り / 自由構造の場合は画像貼り付けのフォールバックになります（pptxgenjs）
 - Copy URL ボタンで現在URLをクリップボードにコピーできます。圧縮URL（`#b=...` / `#z=...`）で開いている場合は、展開後の生HTMLを `#` 以降にそのまま埋めた「非圧縮の元URL」を生成してコピーします（AIに読ませたり、デコードして中身を見たい場合に便利です）
-- Copy Short URL ボタンで、現在のアーティファクトを圧縮した短縮URLとしてクリップボードにコピーできます。圧縮前に **A-1 ミニファイ**（HTML から不要な空白とコメントを削除、表示は等価）を適用し、さらに **A-3 静的辞書置換**（`<!DOCTYPE html>` `<meta charset="UTF-8">` 等の頻出トークンを 1 バイトの制御文字に置換）を適用したものとしないものの両方を試行します。その上で **5 種の圧縮形式**（zstd / Brotli / deflate-raw / gzip / **LZMA**）と並列に組み合わせ、合計最大 10 候補のうちペイロードが最短になったものを採用します（同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA）。出力形式は採用された組み合わせで決まり、小文字プレフィックスが辞書なし版（`#s=` zstd / `#b=` Brotli / `#d=` deflate-raw / `#z=` gzip / `#l=` LZMA）、大文字プレフィックスが辞書あり版（`#S=` / `#B=` / `#D=` / `#Z=` / `#L=`）です。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API と CDN ロードする LZMA-JS（pure-JS、約 85 KB）のみで動作します。圧縮率は内容に依存しますが、典型的には元URLの **18〜35%程度**（前処理 + 最良形式）まで縮みます
+- Copy Short URL ボタンで、現在のアーティファクトを圧縮した短縮URLとしてクリップボードにコピーできます。圧縮前に **A-1 ミニファイ**（HTML から不要な空白・コメント削除、CSS圧縮、冗長な属性除去、表示は等価）を適用し、さらに **A-3 静的辞書置換**（HTML頻出トークン28種を1バイトの制御文字に置換）および **カスタム辞書プレフィックス**（HTML/CSS/JS頻出パターン約2.5KBをデータ先頭に付加し、LZ系圧縮の後方参照効率を向上）を組み合わせた最大4種の前処理バリアント（±A-3 × ±カスタム辞書）を生成します。その上で **6種の圧縮器**（CompressionStream系: zstd / Brotli / deflate-raw / gzip、CDNロード: **LZMA** / **brotli-wasm quality 11**）と並列に組み合わせ、合計最大 24 候補のうちペイロードが最短になったものを採用します。URLプレフィックス形式は `[<digit>]<letter>=<payload>` で、digit=カスタム辞書バージョン（省略=なし）、letter=圧縮形式（小文字=A-3なし / 大文字=A-3あり）です。例: `#b=` Brotli辞書なし / `#B=` Brotli+A-3 / `#1b=` Brotli+カスタム辞書v1 / `#1B=` Brotli+A-3+カスタム辞書v1。外部サービスを一切経由せず、ブラウザ内蔵の `CompressionStream` API と CDN ロードする LZMA-JS・brotli-wasm のみで動作します。圧縮率は内容に依存しますが、典型的には元URLの **10〜30%程度**（前処理 + カスタム辞書 + 最良形式）まで縮みます
 - `hashchange` イベントに対応しており、URL書き換えで即反映されます（リロード不要）
 - 多スライド・多ページ処理中はツールバーに進捗バーを表示します
 
@@ -54,6 +54,8 @@ URLのハッシュに埋め込んだHTMLをレンダリングし、HTML / PNG / 
     - jsPDF 2.5.1        — Canvas → PDF
     - pptxgenjs 3.12.0   — Canvas → PPTX
     - JSZip 3.10.1       — 複数 PNG を ZIP アーカイブ化
+    - LZMA-JS 2.3.2      — LZMA圧縮/展開（Copy Short URL用、約85KB minified）
+    - brotli-wasm 3.0.0  — Brotli quality 11 圧縮/展開（Copy Short URL用、DecompressionStream非対応ブラウザでのフォールバック展開にも使用）
 - 初期表示ではライブラリを読み込まないため軽量です
 
 ## URL長の実用上限
@@ -117,15 +119,17 @@ iframe の sandbox 属性には以下のトークンを付与しています：
 - URL長上限を超える大規模アーティファクトは Gist 連携等の別経路が必要です
 - `navigator.clipboard.writeText` は HTTPS / localhost 上でのみ動作します（GitHub PagesはHTTPSなので問題ありません）
 - Copy Short URL の圧縮パイプライン詳細
-    - **A-1 HTML ミニファイ**（常時適用、表示等価）：HTML コメントを除去し、連続空白を 1 個のスペースに圧縮し、タグ境界の空白を除去します。`<pre>` / `<textarea>` / `<script>` / `<style>` / `<code>` の内部はホワイトスペースを完全保護するため、コードハイライトや整形済みテキストは壊れません。条件付きコメント（`<!--[if IE]>`）は保持します
-    - **A-3 静的辞書置換**（試行のみ、決定的に有利な場合のみ採用）：`<!DOCTYPE html>` `<meta charset="UTF-8">` `<meta name="viewport" ...>` `</section>` `</script>` `<head>` `</head>` `<body>` `</body>` `</html>` 等の HTML 頻出トークン約 26 種類を、NUL/TAB/LF/CR を避けた 0x01〜0x1F の制御文字 1 バイトに置換します。元 HTML がいずれかの制御文字を既に含んでいる場合は適用不可（その場合は dict なし版のみ採用）。decoder は同じテーブルで逆処理します
-    - **圧縮形式は 5 種を並列試行**：CompressionStream 系（zstd / Brotli / deflate-raw / gzip）と LZMA-JS（CDN 遅延ロード）を、A-3 辞書ありなしと組み合わせて最大 10 候補を `Promise.all` で並列圧縮し、出力ペイロードが最短になったものを採用します。同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA
+    - **A-1 HTML ミニファイ**（常時適用、表示等価）：HTML コメントを除去し、連続空白を 1 個のスペースに圧縮し、タグ境界の空白を除去します。加えて `<style>` 内の CSS を圧縮（コメント除去・空白圧縮・セレクタ間の不要空白除去）し、冗長な `type="text/javascript"` / `type="text/css"` 属性を除去し、boolean 属性（`checked="checked"` → `checked` 等）を短縮します。`<pre>` / `<textarea>` / `<script>` / `<style>` / `<code>` の内部はユニークマーカーで退避して完全保護するため、コードハイライトや整形済みテキストは壊れません。条件付きコメント（`<!--[if IE]>`）は保持します
+    - **A-3 静的辞書置換**（試行のみ、決定的に有利な場合のみ採用）：`<!DOCTYPE html>` `<meta charset="UTF-8">` `<meta name="viewport" ...>` `justify-content:` `background-color:` `border-radius:` `align-items:` `font-weight:` `text-align:` `font-size:` `</section>` `</script>` `</button>` `</header>` 等の HTML/CSS 頻出トークン 28 種類を、NUL/TAB/LF/CR を避けた 0x01〜0x1F の制御文字 1 バイトに置換します。元 HTML がいずれかの制御文字を既に含んでいる場合は適用不可（その場合は dict なし版のみ採用）。decoder は同じテーブルで逆処理します
+    - **カスタム辞書プレフィックス**（試行のみ、バージョン管理された拡張可能設計）：HTML/CSS/JS で頻出するパターン（典型的な `<!DOCTYPE html><html lang="en"><head>...` ボイラープレート、CSS プロパティ群 `display:flex;align-items:center;...`、DOM 操作パターン `document.querySelector("...` 等）約 2.5 KB の辞書文字列をデータ先頭に付加してから圧縮します。LZ 系圧縮のスライディングウィンドウ内に辞書パターンが配置されるため、実データ中のマッチが後方参照で効率よく符号化されます。辞書はバージョン管理された配列 (`CUSTOM_DICTS`) で管理され、新バージョンは末尾に追加するだけで拡張可能です。旧辞書は削除されないため、過去のURLは常にデコード可能です。URLプレフィックスの数字部分（`1b=`, `2B=` 等）がバージョンを示し、デコーダは自動的に正しい辞書を選択します
+    - **圧縮器は 6 種を並列試行**：CompressionStream 系（zstd / Brotli / deflate-raw / gzip）、LZMA-JS（CDN 遅延ロード）、および **brotli-wasm quality 11**（CDN 遅延ロード）を、前処理バリアント（±A-3 × ±カスタム辞書）と組み合わせて最大 24 候補を `Promise.all` で並列圧縮し、出力ペイロードが最短になったものを採用します。brotli-wasm は CompressionStream('brotli') のデフォルト品質（4〜6相当）より高い quality 11（最大）で圧縮するため、10〜25% の追加圧縮が見込めます。出力は標準 Brotli ストリームのため DecompressionStream('brotli') 対応ブラウザではネイティブ展開され、非対応ブラウザでは brotli-wasm 自体でフォールバック展開されます
     - 形式と対応ブラウザ
         - zstd (`#s=` / `#S=` 形式)：CompressionStream API としては現状 Firefox 149+ のみ対応。zstd の HTTP コンテンツエンコーディング対応とは別物で、Chrome / Safari / Edge は未対応です
-        - Brotli (`#b=` / `#B=` 形式)：Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+
+        - Brotli (`#b=` / `#B=` 形式、カスタム辞書付きは `#1b=` / `#1B=` 等)：Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+ でネイティブ展開。非対応ブラウザでも brotli-wasm によるフォールバック展開が可能なため、実質すべてのモダンブラウザで開けます。brotli-wasm quality 11 で圧縮した場合もネイティブ Brotli と同一フォーマットです
         - deflate-raw (`#d=` / `#D=` 形式)：全主要ブラウザ（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）。gzip と同じ DEFLATE 圧縮だがヘッダ・チェックサムが無いため、同じ内容なら常に gzip より約 18 バイト短くなります
         - gzip (`#z=` / `#Z=` 形式)：全主要ブラウザ（Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
         - **LZMA** (`#l=` / `#L=` 形式)：LZMA-JS（pure-JS、約 85 KB minified）を CDN（jsDelivr）から遅延ロードして使用。CompressionStream に依存しないため、対応ブラウザは実質すべてのモダンブラウザ。HTML/CSS/JS で Brotli より 5〜15% 縮むことがありますが、圧縮時間は数秒オーダーになることがあります（圧縮レベル 9 = 最大圧縮）
     - 受信側のブラウザが該当形式を未対応の状態でそのURLを開いた場合は、形式ごとに対応ブラウザを案内するエラー表示になります（LZMA URL は LZMA-JS が読めれば全ブラウザで開けます）
-    - 圧縮率は内容に依存しますが、典型的には元の **18〜35% 程度**（前処理 + 最良形式の組み合わせ）まで縮みます。バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません
-    - 短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません。LZMA-JS のロードのみ jsDelivr CDN への HTTP リクエストが発生しますが、コード本体のダウンロード以外の通信は行いません
+    - URLプレフィックス形式は `[<digit>]<letter>=<payload>` です。digit（省略可）=カスタム辞書バージョン、letter=圧縮形式（小文字=A-3なし / 大文字=A-3あり）。旧形式（`#b=...` 等、数字なし）との後方互換性があります
+    - 圧縮率は内容に依存しますが、典型的には元の **10〜30% 程度**（前処理 + カスタム辞書 + 最良形式の組み合わせ）まで縮みます。バイナリ画像の dataURL 等はすでに圧縮済みのためほとんど縮みません
+    - 短縮URLはブラウザ内で完結するため、外部サービス（短縮URLサービス・pastebin等）への依存・データ送信は一切ありません。LZMA-JS・brotli-wasm のロードのみ CDN（jsDelivr / unpkg）への HTTP リクエストが発生しますが、コード本体のダウンロード以外の通信は行いません

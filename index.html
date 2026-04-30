@@ -74,11 +74,15 @@
     .replace(/&apos;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => {
       const cp = parseInt(n, 10);
-      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+      // cp > 0x10FFFF など無効なコードポイントで fromCodePoint が RangeError を投げるのを防ぎ、
+      // 元の文字参照をそのまま残す。
+      try { return Number.isFinite(cp) ? String.fromCodePoint(cp) : _; }
+      catch (e) { return _; }
     })
     .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
       const cp = parseInt(n, 16);
-      return Number.isFinite(cp) ? String.fromCodePoint(cp) : _;
+      try { return Number.isFinite(cp) ? String.fromCodePoint(cp) : _; }
+      catch (e) { return _; }
     })
     .replace(/&amp;/g, '&');
 
@@ -147,11 +151,12 @@
     FORMAT_BY_PREFIX[prefix.toUpperCase()] = format;    // v2: 辞書あり
   });
   /**
-   * 短縮URLのハッシュ部分を拾う正規表現（1文字プレフィックス + '=' + base64url）。
-   * プレフィックスは小文字 (`b`/`z`/`d`/`s`/`l`) または大文字 (`B`/`Z`/`D`/`S`/`L`)。
-   * 大文字 = 圧縮前に静的辞書置換 (A-3) を適用しているため、展開後に逆処理が必要。
+   * 短縮URLのハッシュ部分を拾う正規表現。
+   * プレフィックス形式: [<digit>]<letter>  digit=カスタム辞書バージョン(省略=なし), letter=圧縮形式
+   *   小文字 (b/z/d/s/l) = A-3 辞書なし、大文字 (B/Z/D/S/L) = A-3 辞書あり
+   *   数字プレフィックス (1b, 1B 等) = カスタム辞書プレフィックス v1〜 適用
    */
-  const SHORT_URL_HASH_RE = /^([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
+  const SHORT_URL_HASH_RE = /^(\d?)([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
 
   /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
@@ -163,6 +168,17 @@
     // 全形式が失敗した場合のみ compressHtml が throw してエラー表示になる。
     shortenBtn.disabled = !!busy || !hasArtifact;
     if (!busy) hideProgress();
+  };
+
+  /** Promise にタイムアウトを付与。ms 以内に resolve/reject しなければ Error で reject する。
+   *  元 Promise が先に settle した場合はタイマーを即座にクリアし、
+   *  不要な reject による unhandledrejection イベントの発生を防ぐ。 */
+  const withTimeout = (promise, ms, label) => {
+    let timer;
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(() => rej(new Error((label || 'operation') + ' timed out (' + (ms / 1000) + 's)')), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   };
 
   const downloadBlob = (blob, filename) => {
@@ -193,22 +209,32 @@
    *   - <pre> / <textarea> / <script> / <style> / <code> の内部はユニークマーカーで退避して完全保護
    */
   const minifyHtml = (html) => {
-    const PRESERVE_TAGS = ['pre', 'textarea', 'script', 'style', 'code'];
     const preserved = [];
-    // ランダム生成のユニークなテキストマーカー（同一 HTML にそのマーカーがたまたま含まれる確率はゼロに近い）。
-    // 制御文字を使わず可読 ASCII のみで構成し、コンテントストレージシステムとの不適合を避ける。
     const marker = 'UATPRES' + Math.random().toString(36).slice(2, 10) + 'X';
-    const preservedRe = new RegExp('<(' + PRESERVE_TAGS.join('|') + ')\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>', 'gi');
-    let work = html.replace(preservedRe, (match) => {
-      const token = marker + preserved.length + 'X';
-      preserved.push(match);
-      return token;
+    const preserve = (m) => { const t = marker + preserved.length + 'X'; preserved.push(m); return t; };
+    let work = html;
+    // pre/textarea/code はそのまま保護
+    work = work.replace(/<(pre|textarea|code)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, preserve);
+    // <script> を <style> より先に保護する。これにより JS 文字列中に含まれる
+    // `<style>...</style>` が CSS ミニファイ対象にならず、JS コードが壊れない。
+    work = work.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, preserve);
+    // <style> 内 CSS をミニファイしてから保護
+    work = work.replace(/(<style[^>]*>)([\s\S]*?)(<\/style>)/gi, (_, o, css, c) => {
+      let s = css.replace(/\/\*[\s\S]*?\*\//g, '');
+      s = s.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+      s = s.replace(/\s*\{\s*/g, '{').replace(/;\s*}\s*/g, '}').replace(/\s*}\s*/g, '}');
+      return preserve(o + s + c);
     });
-    // HTML コメント除去（条件付きコメントは保持: 先頭が `[if` で始まるものは残す）
+    // HTML コメント除去（条件付きコメントは保持）
     work = work.replace(/<!--([\s\S]*?)-->/g, (m, body) => /^\[if\b/i.test(body) ? m : '');
-    // 連続空白を 1 個に圧縮 / タグ境界の空白を除去 / 先頭末尾トリム
+    // 連続空白圧縮 / タグ境界の空白除去
     work = work.replace(/\s+/g, ' ').replace(/>\s+</g, '><').trim();
-    // ユニークマーカーを元に戻す
+    // 冗長な type 属性を除去
+    work = work.replace(/ type=["']text\/javascript["']/gi, '');
+    work = work.replace(/ type=["']text\/css["']/gi, '');
+    // Boolean 属性を短縮 (checked="checked" → checked)
+    work = work.replace(/ (checked|disabled|readonly|required|autofocus|autoplay|controls|defer|async|hidden|multiple|selected|novalidate)=["'][^"']*["']/gi, ' $1');
+    // マーカー復元
     const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
     work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
     return work;
@@ -229,24 +255,26 @@
     '<!doctype html>',
     '<html lang="ja">',
     '<html lang="en">',
+    'justify-content:',
+    'background-color:',
+    'border-radius:',
+    '<div class="',
+    'align-items:',
+    'font-weight:',
+    'text-align:',
+    'font-size:',
     '</section>',
-    '</header>',
     '<\/script>',
+    '</button>',
     '<section ',
     '<section>',
+    '</header>',
     '<header>',
     '<script>',
     '</style>',
-    '</title>',
-    '</body>',
-    '</html>',
     '<style>',
-    '<title>',
-    '<body>',
-    '<head>',
     '</span>',
-    '</div>',
-    '</li>'
+    '</div>'
   ];
   const DICT_SENTINELS = (() => {
     const arr = [];
@@ -298,6 +326,99 @@
     return bytes;
   };
 
+  // ============================================================
+  // brotli-wasm (quality 11, CDN 遅延ロード)
+  //   CompressionStream('brotli') はデフォルト quality 4〜6 程度。brotli-wasm を
+  //   quality 11（最大）で使うと 10〜25% 追加圧縮が見込める。出力は標準 Brotli
+  //   ストリームのため DecompressionStream('brotli') で展開可能。非対応ブラウザ
+  //   では brotli-wasm 自体で展開にフォールバックする。
+  // ============================================================
+  // loadScript と同様に Promise をキャッシュし、並行呼び出し時の二重ロードを防止する。
+  // 失敗時はキャッシュを破棄してリトライ可能にする。
+  let _brotliWasmP = null;
+  const loadBrotliWasm = () => {
+    if (_brotliWasmP) return _brotliWasmP;
+    // loadScript と同様に 30 秒でタイムアウト。CDN がハングすると import() が永久に
+    // 解決されず、compressHtml の Promise.all や brotli フォールバック展開が固まるため。
+    _brotliWasmP = withTimeout((async () => {
+      const mod = await import('https://unpkg.com/brotli-wasm@3.0.0/index.web.js');
+      let brotli = mod.default || mod;
+      if (typeof brotli === 'function') brotli = await brotli();
+      if (brotli && typeof brotli.then === 'function') brotli = await brotli;
+      if (!brotli || typeof brotli.compress !== 'function') throw new Error('brotli-wasm: invalid module');
+      return brotli;
+    })(), 30000, 'brotli-wasm load').catch(e => { _brotliWasmP = null; throw e; });
+    return _brotliWasmP;
+  };
+  const compressBrotliWasm = async (text) => {
+    const brotli = await loadBrotliWasm();
+    const compressed = brotli.compress(new TextEncoder().encode(text), { quality: 11 });
+    return bytesToBase64Url(new Uint8Array(compressed));
+  };
+  const decompressBrotliWasm = async (b64url) => {
+    const brotli = await loadBrotliWasm();
+    const decompressed = brotli.decompress(base64UrlToBytes(b64url));
+    return new TextDecoder().decode(decompressed);
+  };
+
+  // ============================================================
+  // カスタム辞書圧縮 (バージョン管理・拡張可能設計)
+  //   圧縮前に HTML/CSS/JS 頻出パターンの辞書文字列をデータ先頭に付加する。
+  //   LZ系圧縮のスライディングウィンドウ内に辞書パターンが配置されるため、
+  //   実データ中のマッチが後方参照で効率よく符号化され、圧縮率が改善される。
+  //   辞書は不変の配列で管理し、新バージョンは末尾に追加するだけ。
+  //   旧バージョンの辞書は削除しないため、過去の URL は常にデコード可能。
+  // ============================================================
+  const CUSTOM_DICT_V1 = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title></title><style>*{box-sizing:border-box;margin:0;padding:0}'
+    + 'body{font-family:system-ui,-apple-system,sans-serif;line-height:1.5;color:#333;background:#fff}'
+    + '.container{max-width:1200px;width:100%;margin:0 auto;padding:0 20px}'
+    + 'display:flex;align-items:center;justify-content:center;justify-content:space-between;'
+    + 'flex-direction:column;flex-direction:row;position:relative;position:absolute;'
+    + 'font-size:16px;font-size:14px;font-size:24px;font-size:12px;font-size:20px;'
+    + 'font-weight:bold;font-weight:600;font-weight:700;'
+    + 'text-align:center;text-align:left;color:#333;color:#666;color:#fff;color:inherit;'
+    + 'background-color:#fff;background-color:#f5f5f5;background-color:transparent;'
+    + 'border-radius:8px;border-radius:4px;border-radius:12px;border-radius:50%;'
+    + 'padding:4px;padding:8px;padding:12px;padding:16px;padding:20px;padding:24px;'
+    + 'margin:0 auto;margin:0;margin-bottom:;margin-top:;'
+    + 'width:100%;height:100%;max-width:;min-height:100vh;overflow:hidden;overflow:auto;'
+    + 'border:none;border:1px solid #ddd;border:1px solid #eee;border-bottom:1px solid;'
+    + 'box-shadow:0 2px 4px rgba(0,0,0,0.1);box-shadow:0 4px 6px rgba(0,0,0,0.1);'
+    + 'transition:all 0.3s ease;transition:all 0.2s;transform:translateX(;transform:translateY(;'
+    + 'opacity:0;opacity:1;cursor:pointer;gap:4px;gap:8px;gap:12px;gap:16px;gap:24px;'
+    + 'z-index:;white-space:nowrap;text-overflow:ellipsis;text-decoration:none;'
+    + 'grid-template-columns:;@media(max-width:768px){</style></head><body>'
+    + '<div class="container"><div class=""><span class=""><button class="">'
+    + '<a href="#" class=""><img src="" alt=""><input type="text" class="">'
+    + '<h1 class=""><h2 class=""><h3 class=""><p class=""><section class="">'
+    + '</div></span></button></a></li></ul></h1></h2></h3></p></section></header></footer>'
+    + '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M</svg>'
+    + 'addEventListener("DOMContentLoaded",function(){'
+    + 'addEventListener("click",function(e){e.preventDefault();'
+    + 'document.querySelector(".document.querySelectorAll(".'
+    + 'document.getElementById("classList.add("classList.remove("'
+    + 'style.display="innerHTML="textContent="'
+    + 'function(){return}const =>{Math.floor(Math.random()*'
+    + 'JSON.stringify(JSON.parse(console.log("'
+    + '</script></body></html>';
+  // バージョン管理配列: index=バージョン番号。0=辞書なし。新辞書は末尾に append するだけ。
+  const CUSTOM_DICTS = [null, CUSTOM_DICT_V1];
+  const CURRENT_DICT_VERSION = 1;
+  /** 辞書をデータ先頭に付加 */
+  const dictPrefixApply = (text, version) => {
+    const dict = CUSTOM_DICTS[version];
+    return dict ? dict + text : text;
+  };
+  /** 辞書プレフィックスを除去（辞書の固定長分を先頭からスキップ） */
+  const dictPrefixStrip = (text, version) => {
+    const dict = CUSTOM_DICTS[version];
+    return dict ? text.slice(dict.length) : text;
+  };
+
   /** UTF-8 エンコード → CompressionStream(format) → base64url。format は brotli/gzip/deflate-raw/zstd */
   const compressWithStream = async (text, format) => {
     const enc = new TextEncoder();
@@ -317,7 +438,10 @@
   const compressLzma = async (text) => {
     await loadScript(URLS.lzma);
     if (!window.LZMA) throw new Error('LZMA library failed to load');
-    const out = await new Promise((resolve, reject) => {
+    // LZMA mode 9 は大きな入力で数十秒かかることがある。Web Worker がストールまたは
+    // クラッシュすると callback が永久に呼ばれず Promise がハングし、UI が busy のまま
+    // 固まる事故を防ぐため、30 秒でタイムアウトさせる。
+    const out = await withTimeout(new Promise((resolve, reject) => {
       window.LZMA.compress(text, 9, (result, err) => {
         if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
         // ワーカー異常や中断ケースで result が null/undefined になると、以前のコードでは
@@ -331,7 +455,7 @@
         for (let i = 0; i < result.length; i++) bytes[i] = result[i] & 0xFF;
         resolve(bytes);
       });
-    });
+    }), 30000, 'LZMA compress');
     return bytesToBase64Url(out);
   };
   /** LZMA-JS の展開。decompress 結果は string（UTF-8 デコード済み）。 */
@@ -340,7 +464,8 @@
     if (!window.LZMA) throw new Error('LZMA library failed to load');
     const bytes = base64UrlToBytes(b64url);
     const arr = Array.from(bytes); // LZMA.decompress は Array<number> または Int8Array を受け取る
-    return await new Promise((resolve, reject) => {
+    // 展開は通常高速だが、Worker ストール対策として 15 秒でタイムアウト。
+    return await withTimeout(new Promise((resolve, reject) => {
       window.LZMA.decompress(arr, (result, err) => {
         if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
         // result が null/undefined のとき String(result) は "null"/"undefined" という文字列になるため
@@ -351,14 +476,9 @@
         }
         resolve(typeof result === 'string' ? result : String(result));
       });
-    });
+    }), 15000, 'LZMA decompress');
   };
 
-  /** format 別の圧縮ディスパッチャ。戻り値: base64url ペイロード文字列。失敗時は throw。 */
-  const compressByFormat = async (text, format) => {
-    if (format === 'lzma') return compressLzma(text);
-    return compressWithStream(text, format);
-  };
   /** format 別の展開ディスパッチャ。戻り値: UTF-8 文字列。 */
   const decompressByFormat = async (b64url, format) => {
     if (format === 'lzma') return decompressLzma(b64url);
@@ -366,50 +486,67 @@
   };
 
   /**
-   * Copy Short URL の本体。HTML を A-1 ミニファイし、A-3 辞書ありなし × 全形式（最大 5 種 × 2 = 10 候補）を
-   * 並列に試行して最短ペイロードを選ぶ。
-   * 戻り値: { format, prefix, dict, payload, preprocessedSize }
+   * Copy Short URL の本体。HTML を A-1 ミニファイし、以下の組み合わせを並列に試行して最短ペイロードを採用:
+   *   - 前処理: ±A-3 静的辞書 × ±カスタム辞書プレフィックス (v1〜)
+   *   - 圧縮: zstd / brotli / brotli-wasm(q11) / deflate-raw / gzip / LZMA
+   * プレフィックス形式: [<digit>]<letter>  digit=辞書バージョン, letter=圧縮形式(大文字=A-3)
+   * 戻り値: { format, prefix, dict, customDictVersion, payload, preprocessedSize }
    */
   const compressHtml = async (html) => {
     const minified = minifyHtml(html);
-    const variants = [{ html: minified, dict: false }];
-    if (dictCanApply(minified)) {
-      variants.push({ html: dictApply(minified), dict: true });
-    }
-    // 実環境で対応している CompressionStream 系 + 常に試す LZMA
-    const formats = [
-      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]),
-      { prefix: 'l', format: 'lzma' }
+    // 前処理バリアント: ±A-3 辞書 × ±カスタム辞書プレフィックス
+    const a3ok = dictCanApply(minified);
+    const a3text = a3ok ? dictApply(minified) : null;
+    const variants = [
+      { text: minified, a3: false, cdv: 0 }
     ];
-    if (formats.length === 0) throw new Error('no compression formats are available');
+    if (a3ok) variants.push({ text: a3text, a3: true, cdv: 0 });
+    variants.push({ text: dictPrefixApply(minified, CURRENT_DICT_VERSION), a3: false, cdv: CURRENT_DICT_VERSION });
+    if (a3ok) variants.push({ text: dictPrefixApply(a3text, CURRENT_DICT_VERSION), a3: true, cdv: CURRENT_DICT_VERSION });
+    // 圧縮器リスト: CompressionStream 系 + LZMA + brotli-wasm(q11)
+    const compressors = [
+      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]).map(f => ({
+        pfx: f.prefix, fmt: f.format, fn: (t) => compressWithStream(t, f.format)
+      })),
+      { pfx: 'l', fmt: 'lzma', fn: (t) => compressLzma(t) },
+      { pfx: 'b', fmt: 'brotli', fn: (t) => compressBrotliWasm(t) }
+    ];
+    if (compressors.length === 0) throw new Error('no compression formats are available');
+    // 全組み合わせを並列試行
     const trials = [];
     for (const v of variants) {
-      for (const f of formats) {
-        trials.push({ html: v.html, dict: v.dict, format: f.format, prefix: f.prefix });
+      for (const c of compressors) {
+        trials.push({ text: v.text, a3: v.a3, cdv: v.cdv, pfx: c.pfx, fmt: c.fmt, fn: c.fn });
       }
     }
-    const settled = await Promise.all(trials.map(async (t) => {
+    const results = (await Promise.all(trials.map(async (t) => {
       try {
-        const payload = await compressByFormat(t.html, t.format);
-        const prefix = t.dict ? t.prefix.toUpperCase() : t.prefix;
-        return { format: t.format, prefix, dict: t.dict, payload, preprocessedSize: t.html.length };
-      } catch (e) {
-        return null;
-      }
-    }));
-    const results = settled.filter(Boolean);
+        const payload = await t.fn(t.text);
+        const letter = t.a3 ? t.pfx.toUpperCase() : t.pfx;
+        const prefix = (t.cdv > 0 ? String(t.cdv) : '') + letter;
+        return { format: t.fmt, prefix, dict: t.a3, customDictVersion: t.cdv, payload, preprocessedSize: t.text.length };
+      } catch (e) { return null; }
+    }))).filter(Boolean);
     if (results.length === 0) throw new Error('compression failed for all available formats');
-    // 最短ペイロードを採用（同点は trials の挿入順: dict なし→あり、形式は zstd→brotli→deflate-raw→gzip→LZMA）
     return results.reduce((best, cur) => cur.payload.length < best.payload.length ? cur : best);
   };
 
   /**
-   * format + base64url + dictApplied から UTF-8 HTML を復元する。
-   * dictApplied=true（v2 大文字プレフィックス）のときのみ A-3 辞書を逆処理する。
-   * A-1 ミニファイは表示上等価なので逆処理不要。
+   * format + base64url + dictApplied + customDictVersion から UTF-8 HTML を復元する。
+   * brotli で DecompressionStream 非対応の場合は brotli-wasm にフォールバック。
+   * customDictVersion > 0 → 辞書プレフィックス除去、dictApplied=true → A-3 逆処理。
    */
-  const decompressHtml = async (format, b64url, dictApplied) => {
-    const text = await decompressByFormat(b64url, format);
+  const decompressHtml = async (format, b64url, dictApplied, customDictVersion) => {
+    let text;
+    if (format === 'brotli' && !decompressSupport['brotli']) {
+      text = await decompressBrotliWasm(b64url);
+    } else {
+      text = await decompressByFormat(b64url, format);
+    }
+    if (customDictVersion > 0) {
+      if (!CUSTOM_DICTS[customDictVersion]) throw new Error('unsupported custom dictionary version: ' + customDictVersion);
+      text = dictPrefixStrip(text, customDictVersion);
+    }
     return dictApplied ? dictReverse(text) : text;
   };
 
@@ -597,13 +734,15 @@
     //   大文字 (v2, 辞書あり): S/B/D/Z/L  ← 展開後に A-3 辞書を逆処理する
     const compressedMatch = raw.match(SHORT_URL_HASH_RE);
     if (compressedMatch) {
-      const prefixChar = compressedMatch[1];
+      const customDictVersion = compressedMatch[1] ? parseInt(compressedMatch[1], 10) : 0;
+      const prefixChar = compressedMatch[2];
       const fmt = FORMAT_BY_PREFIX[prefixChar];
       const dictApplied = (prefixChar === prefixChar.toUpperCase());
-      const payload = compressedMatch[2];
+      const payload = compressedMatch[3];
       // LZMA は CDN ロード後に常に動く前提。CompressionStream 系のみブラウザ非対応の可能性がある。
       const isStreamFmt = (fmt !== 'lzma');
-      if (isStreamFmt && (!compressionSupported || !decompressSupport[fmt])) {
+      const hasFallbackDecompress = (fmt === 'brotli');
+      if (isStreamFmt && !hasFallbackDecompress && (!compressionSupported || !decompressSupport[fmt])) {
         if (mySeq !== renderSeq) return;
         const reasons = {
           brotli: 'this URL uses Brotli; please open in Chrome 144+ / Firefox 147+ / Safari 19+',
@@ -624,9 +763,12 @@
         setBusy(false);
         return;
       }
-      setStatus('decompressing (' + fmt + (dictApplied ? '+dict' : '') + ')...');
+      const dtags = [fmt];
+      if (dictApplied) dtags.push('A3');
+      if (customDictVersion > 0) dtags.push('dict-v' + customDictVersion);
+      setStatus('decompressing (' + dtags.join('+') + ')...');
       try {
-        html = await decompressHtml(fmt, payload, dictApplied);
+        html = await decompressHtml(fmt, payload, dictApplied, customDictVersion);
       } catch (e) {
         if (mySeq !== renderSeq) return;
         setStatus('decompress failed: ' + (e && e.message ? e.message : e));
@@ -674,17 +816,6 @@
     windowWidth: ww || doc.documentElement.scrollWidth,
     windowHeight: hh || doc.documentElement.scrollHeight
   });
-
-  /** PNG用：現在のビュー1枚だけ */
-  const captureSingle = async () => {
-    await loadScript(URLS.html2canvas);
-    await waitForFrame();
-    const doc = frame.contentDocument;
-    if (!doc || !doc.documentElement) {
-      throw new Error('iframe document is unavailable (sandbox may be too strict)');
-    }
-    return snapshot(doc);
-  };
 
   /**
    * スライド構造を自動検出して順番に撮影。
@@ -1436,15 +1567,14 @@
   };
 
   /**
-   * 現在のアーティファクトを A-1 ミニファイ + A-3 辞書置換（試行のみ）で前処理した上で、
-   * 全圧縮形式（zstd / Brotli / deflate-raw / gzip / LZMA）× 辞書ありなしを並列に試行し、
+   * 現在のアーティファクトを A-1 ミニファイ + ±A-3 静的辞書 + ±カスタム辞書プレフィックス(v1〜) で前処理した上で、
+   * 全圧縮形式（zstd / brotli / brotli-wasm(q11) / deflate-raw / gzip / LZMA）を並列に試行し、
    * 最短ペイロードを採用した短縮URLをクリップボードにコピーする。
-   * 出力プレフィックスは小文字 (v1, 辞書なし) / 大文字 (v2, 辞書あり) で表現する：
-   *   `#s=` zstd / `#b=` Brotli / `#d=` deflate-raw / `#z=` gzip / `#l=` LZMA
-   *   `#S=` / `#B=` / `#D=` / `#Z=` / `#L=` は同形式の辞書あり版。
-   * 同点時の優先順は dict なし → dict あり、形式は zstd > Brotli > deflate-raw > gzip > LZMA。
-   * 外部サービスへの送信は一切行わない（CompressionStream API + LZMA-JS 同梱ライブラリのみ）。
-   * 圧縮率は内容に依存するが、典型的には元の 18〜35%（前処理 + 最良形式）。
+   * プレフィックス形式: [<digit>]<letter>
+   *   小文字 (b/z/d/s/l) = A-3 なし、大文字 = A-3 あり
+   *   数字プレフィックス (1b, 1B 等) = カスタム辞書 v1〜 適用
+   * 外部サービスへの送信は一切行わない（CompressionStream API + brotli-wasm + LZMA-JS のみ）。
+   * 圧縮率は内容に依存するが、典型的には元の 10〜30%（前処理 + カスタム辞書 + 最良形式）。
    */
   const copyShortUrl = async () => {
     if (!currentHtml) {
@@ -1459,7 +1589,7 @@
     setBusy(true);
     setStatus('compressing...');
     try {
-      const { format, prefix, dict, payload } = await compressHtml(sourceHtml);
+      const { format, prefix, dict, customDictVersion, payload } = await compressHtml(sourceHtml);
       if (sourceHtml !== currentHtml) {
         setStatus('artifact changed during compression — please retry');
         return;
@@ -1476,7 +1606,10 @@
       const original = shortenBtn.textContent;
       shortenBtn.textContent = 'Copied';
       setTimeout(() => { shortenBtn.textContent = original; }, 1500);
-      const tag = format + (dict ? '+dict' : '');
+      const ctags = [format];
+      if (dict) ctags.push('A3');
+      if (customDictVersion > 0) ctags.push('dict-v' + customDictVersion);
+      const tag = ctags.join('+');
       setStatus('Short URL copied (' + tag + ', ' + formatBytes(baselineLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
     } catch (e) {
       setStatus('shorten failed: ' + (e && e.message ? e.message : e));
@@ -1547,9 +1680,10 @@
   // 初期 render の unhandled rejection もステータスに表示してサイレント失敗を防ぐ。
   render().catch(e => setStatus('init failed: ' + (e && e.message ? e.message : e)));
 
-  // LZMA-JS をバックグラウンドで先読みしておく（初回 Copy Short URL クリック時の待ち時間を削減）。
-  // 失敗してもサイレントに無視する（compressLzma 内で同じ loadScript が必要時に再試行されるため）。
+  // LZMA-JS ・ brotli-wasm をバックグラウンドで先読みしておく（初回 Copy Short URL クリック時の待ち時間を削減）。
+  // 失敗してもサイレントに無視する（各圧縮関数内で必要時に再試行されるため）。
   loadScript(URLS.lzma).catch(() => {});
+  loadBrotliWasm().catch(() => {});
 })();
 </script>
 </body>
