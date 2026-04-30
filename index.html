@@ -41,6 +41,8 @@
 </header>
 <iframe id="frame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-same-origin"></iframe>
 <script src="dicts.js"></script>
+<script src="dynamic-dict.js"></script>
+<script src="sdht.js"></script>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -258,7 +260,7 @@
       s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*1\s*\)/g, '#fff');
       s = s.replace(/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/g, 'transparent');
       s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*0\s*\)/g, 'transparent');
-      // margin/padding の同値ショートハンド。CSSは1値=全方向、、3値 0 0 0 は上・左右・下として全て 0 なので 1値に集約可能。
+      // margin/padding の同値ショートハンド。CSSは1値=全方向、3値 0 0 0 は上・左右・下として全て 0 なので 1値に集約可能。
       s = s.replace(/\b(margin|padding):0 0 0 0\b/g, '$1:0');
       s = s.replace(/\b(margin|padding):0 0 0\b(?![ \d])/g, '$1:0');
       s = s.replace(/\b(margin|padding):0 0\b(?![ \d])/g, '$1:0');
@@ -267,9 +269,9 @@
       s = s.replace(/\boutline:none\b/g, 'outline:0');
       s = s.replace(/\bborder:none\b/g, 'border:0');
       s = s.replace(/\bborder-(top|right|bottom|left):none\b/g, 'border-$1:0');
-      // 並んだセレクターコンマの前後空白も復入させる (a , b → a,b)
+      // 並んだセレクターコンマの前後空白を除去する (a , b → a,b)
       s = s.replace(/\s*,\s*/g, ',');
-      // タグ関連以外の冗長セミコロンを除去 (とされていない最後のプロパティ ; は不要)
+      // 閉じ括弧の前にある最後のプロパティの ; は不要 (color:red;} → color:red})
       s = s.replace(/;}/g, '}');
       // 退避した文字列を復元
       const cssRestoreRe = new RegExp(cssMarker + '(\\d+)X', 'g');
@@ -476,6 +478,44 @@
   }
   const CUSTOM_DICTS = (_UAT_DICTS && _UAT_DICTS.CUSTOM_DICTS) || [null];
   const CURRENT_DICT_VERSION = (_UAT_DICTS && typeof _UAT_DICTS.CURRENT_DICT_VERSION === 'number') ? _UAT_DICTS.CURRENT_DICT_VERSION : 0;
+
+  // ============================================================
+  // V6 動的辞書 (dynamic-dict.js)
+  //   コンテンツ依存辞書: 圧縮直前に HTML 本体から頻出 n-gram を抽出し、
+  //   V5 静的辞書 + 動的辞書 + 本体 の 3 段プレフィックスで圧縮する。
+  //   URL ペイロード先頭に varint で動的辞書長を埋め込み、デコーダはそれを
+  //   読み出して slice する。dynamic-dict.js のロードに失敗した場合は V6
+  //   バリアントを生成せず、V5 までで動作を継続する (URL 互換性に影響なし)。
+  // ============================================================
+  const _UAT_DYN = window.UAT_DYNAMIC_DICT;
+  if (!_UAT_DYN || typeof _UAT_DYN.buildDictionary !== 'function') {
+    console.warn('[url-to-artifact] dynamic-dict.js not loaded; V6 dynamic dictionary disabled');
+  }
+  const DYNAMIC_DICT_AVAILABLE = !!(_UAT_DYN
+    && typeof _UAT_DYN.buildDictionary === 'function'
+    && typeof _UAT_DYN.chooseBudget === 'function'
+    && typeof _UAT_DYN.varintEncode === 'function'
+    && typeof _UAT_DYN.varintDecode === 'function');
+  // V6 は常に V5 静的辞書 + 動的辞書の組み合わせ。将来 V7 静的辞書が追加された際は
+  // 別の cdv 値 (7 等) を割り当て、本定数を分岐させる。
+  const STATIC_DICT_FOR_V6 = 5;
+
+  // ============================================================
+  // V7 SDHT (sdht.js)
+  //   コンテンツ依存トークン置換: 圧縮直前に HTML 本体から頻出 n-gram を抽出し、
+  //   ESC + index の 2 バイトトークンに置換した後で圧縮する。V6 が LZ 圧縮の
+  //   辞書プレフィックスとして外部辞書を提供するのに対し、V7 は本体を物理的に
+  //   短縮してから圧縮器に渡す。両者は補完関係。
+  //   sdht.js のロード失敗時は V7 バリアントを生成せず、V1〜V6 で動作を継続する。
+  // ============================================================
+  const _UAT_SDHT = window.UAT_SDHT;
+  if (!_UAT_SDHT || typeof _UAT_SDHT.encode !== 'function') {
+    console.warn('[url-to-artifact] sdht.js not loaded; V7 in-body tokenization disabled');
+  }
+  const SDHT_AVAILABLE = !!(_UAT_SDHT
+    && typeof _UAT_SDHT.encode === 'function'
+    && typeof _UAT_SDHT.decode === 'function');
+
   /** 辞書をデータ先頭に付加 */
   const dictPrefixApply = (text, version) => {
     const dict = CUSTOM_DICTS[version];
@@ -578,6 +618,51 @@
       variants.push({ text: dictPrefixApply(minified, CURRENT_DICT_VERSION), a3: false, cdv: CURRENT_DICT_VERSION });
       if (a3ok) variants.push({ text: dictPrefixApply(a3text, CURRENT_DICT_VERSION), a3: true, cdv: CURRENT_DICT_VERSION });
     }
+    // V6 動的辞書バリアント: dynamic-dict.js が利用可能 + V5 静的辞書がロード済 + 本体が
+    // chooseBudget の閾値を超える場合のみ生成する。動的辞書は本体の n-gram から構築するため、
+    // A-3 適用前後で別途構築する (control-byte 置換後の方が短く整列することがある)。
+    if (DYNAMIC_DICT_AVAILABLE && CUSTOM_DICTS[STATIC_DICT_FOR_V6]) {
+      const v6Static = CUSTOM_DICTS[STATIC_DICT_FOR_V6];
+      const v6Budget = _UAT_DYN.chooseBudget(minified.length);
+      if (v6Budget > 0) {
+        try {
+          const dynNoA3 = _UAT_DYN.buildDictionary(minified, v6Budget);
+          if (dynNoA3) {
+            variants.push({ text: v6Static + dynNoA3 + minified, a3: false, cdv: 6, dynDictLen: dynNoA3.length });
+          }
+          if (a3ok) {
+            const dynA3 = _UAT_DYN.buildDictionary(a3text, v6Budget);
+            if (dynA3) {
+              variants.push({ text: v6Static + dynA3 + a3text, a3: true, cdv: 6, dynDictLen: dynA3.length });
+            }
+          }
+        } catch (e) {
+          // 動的辞書構築失敗時は V6 をスキップして V5 までを採用 (LOG だけ残す)。
+          console.warn('[url-to-artifact] V6 dynamic dictionary build failed:', e && e.message ? e.message : e);
+        }
+      }
+    }
+    // V7 SDHT バリアント: 本体内トークン置換。chooseBudget で本体長閾値を判定し、
+    // 利得が見込める場合のみ追加する。SDHT.encode は失敗時 null を返すので
+    // try/catch は予期しない例外 (バグ) の保険として置いておく。A-3 適用前後で
+    // 別途 encode する: A-3 後の本体は制御文字 0x01-0x1C が散らばっており、SDHT が
+    // 抽出する n-gram もそれを含むため、A-3 ありなしで最適な辞書が異なる。
+    if (SDHT_AVAILABLE) {
+      try {
+        const sdhtNoA3 = _UAT_SDHT.encode(minified);
+        if (sdhtNoA3) {
+          variants.push({ text: sdhtNoA3, a3: false, cdv: 7 });
+        }
+        if (a3ok) {
+          const sdhtA3 = _UAT_SDHT.encode(a3text);
+          if (sdhtA3) {
+            variants.push({ text: sdhtA3, a3: true, cdv: 7 });
+          }
+        }
+      } catch (e) {
+        console.warn('[url-to-artifact] V7 SDHT encode failed:', e && e.message ? e.message : e);
+      }
+    }
     // 圧縮器リスト: CompressionStream 系 + LZMA + brotli-wasm(q11)
     const compressors = [
       ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]).map(f => ({
@@ -596,14 +681,29 @@
     }
     const results = (await Promise.all(trials.map(async (t) => {
       try {
-        const payload = await t.fn(t.text);
+        let payload = await t.fn(t.text);
+        // V6: 圧縮ペイロード先頭に「動的辞書長 (varint)」を埋め込む。base64 を 1 度デコード
+        // → varint と結合 → 再 base64 と 2 ラウンドかかるが、V6 トライアルのみなので影響小。
+        if (t.cdv === 6 && DYNAMIC_DICT_AVAILABLE) {
+          const compressedBytes = base64UrlToBytes(payload);
+          const varintBytes = _UAT_DYN.varintEncode(t.dynDictLen);
+          const combined = new Uint8Array(varintBytes.length + compressedBytes.length);
+          combined.set(varintBytes, 0);
+          combined.set(compressedBytes, varintBytes.length);
+          payload = bytesToBase64Url(combined);
+        }
         const letter = t.a3 ? t.pfx.toUpperCase() : t.pfx;
         const prefix = (t.cdv > 0 ? String(t.cdv) : '') + letter;
         return { format: t.fmt, prefix, dict: t.a3, customDictVersion: t.cdv, payload, preprocessedSize: t.text.length };
       } catch (e) { return null; }
     }))).filter(Boolean);
     if (results.length === 0) throw new Error('compression failed for all available formats');
-    return results.reduce((best, cur) => cur.payload.length < best.payload.length ? cur : best);
+    // URL 全体長 (#prefix=payload) で比較する。payload のみの比較だと、cdv プレフィックス
+    // (例: '7' = 1 文字、'5' = 1 文字) のオーバーヘッドが無視され、同 payload 長でも V0 の方が
+    // 短い URL になるケースで V5/V6/V7 を採用してしまい URL が無駄に 1、2 文字長くなる事故を防ぐ。
+    return results.reduce((best, cur) =>
+      (cur.prefix.length + cur.payload.length) < (best.prefix.length + best.payload.length) ? cur : best
+    );
   };
 
   /**
@@ -612,6 +712,52 @@
    * customDictVersion > 0 → 辞書プレフィックス除去、dictApplied=true → A-3 逆処理。
    */
   const decompressHtml = async (format, b64url, dictApplied, customDictVersion) => {
+    // V6 (動的辞書 + V5 静的辞書): ペイロード先頭の varint で動的辞書長を読み、
+    // 圧縮データを切り出し、展開後に「V5 辞書長 + 動的辞書長」分を slice で除去する。
+    // この分岐は customDictVersion > 0 の汎用パスより前に置く必要がある (CUSTOM_DICTS[6]
+    // は存在しないため汎用パスに落ちるとエラーになる)。
+    if (customDictVersion === 6) {
+      if (!DYNAMIC_DICT_AVAILABLE) {
+        throw new Error('V6 URL but dynamic-dict.js failed to load');
+      }
+      const v6Static = CUSTOM_DICTS[STATIC_DICT_FOR_V6];
+      if (!v6Static) {
+        throw new Error('V6 requires V' + STATIC_DICT_FOR_V6 + ' static dictionary but none loaded');
+      }
+      const allBytes = base64UrlToBytes(b64url);
+      const decoded = _UAT_DYN.varintDecode(allBytes, 0);
+      const dynDictLen = decoded.value;
+      const compressedBytes = allBytes.slice(decoded.nextOffset);
+      const compressedB64 = bytesToBase64Url(compressedBytes);
+      let raw;
+      if (format === 'brotli' && !decompressSupport['brotli']) {
+        raw = await decompressBrotliWasm(compressedB64);
+      } else {
+        raw = await decompressByFormat(compressedB64, format);
+      }
+      const headerLen = v6Static.length + dynDictLen;
+      if (raw.length < headerLen) {
+        throw new Error('V6 decompressed text too short for headers (got ' + raw.length + ', need ' + headerLen + ')');
+      }
+      const stripped = raw.slice(headerLen);
+      return dictApplied ? dictReverse(stripped) : stripped;
+    }
+    // V7 SDHT (本体内トークン置換): 圧縮ペイロード = compress(SDHT.encode(body)) なので、
+    // 展開後にそのまま SDHT.decode を通せば元の (ミニファイ済み) 本体に戻る。
+    // varint 解析は SDHT.decode 内で行うため、index.html 側で base64 を 2 度 round-trip する必要がない。
+    if (customDictVersion === 7) {
+      if (!SDHT_AVAILABLE) {
+        throw new Error('V7 URL but sdht.js failed to load');
+      }
+      let raw;
+      if (format === 'brotli' && !decompressSupport['brotli']) {
+        raw = await decompressBrotliWasm(b64url);
+      } else {
+        raw = await decompressByFormat(b64url, format);
+      }
+      const decoded = _UAT_SDHT.decode(raw);
+      return dictApplied ? dictReverse(decoded) : decoded;
+    }
     let text;
     if (format === 'brotli' && !decompressSupport['brotli']) {
       text = await decompressBrotliWasm(b64url);
@@ -840,15 +986,28 @@
       }
       const dtags = [fmt];
       if (dictApplied) dtags.push('A3');
-      if (customDictVersion > 0) dtags.push('dict-v' + customDictVersion);
+      if (customDictVersion === 6) dtags.push('dyn-v6');
+      else if (customDictVersion === 7) dtags.push('sdht-v7');
+      else if (customDictVersion > 0) dtags.push('dict-v' + customDictVersion);
       setStatus('decompressing (' + dtags.join('+') + ')...');
       try {
         html = await decompressHtml(fmt, payload, dictApplied, customDictVersion);
       } catch (e) {
         if (mySeq !== renderSeq) return;
         setStatus('decompress failed: ' + (e && e.message ? e.message : e));
-        // フォールバック：生文字列としてデコード（壊れたペイロードでも何か表示する）
-        html = decodeHashHtml(raw);
+        // 壊れたペイロードを raw 文字列として iframe に流し込むと 3 重不具合が連鎖していた:
+        //   (a) エラー status が直後の setStatus(formatBytes(html.length)) で上書きされ見えなくなる
+        //   (b) currentHtml に 'b=ABCDEF...' 等の意味のない文字列が入り、PNG/PDF/PPTX エクスポート
+        //       ボタンが有効化されてゴミデータの保存ができてしまう
+        //   (c) lastContentHash が更新されず、同じハッシュで hashchange が再発火した際に anchor 検出が誤動作
+        // 空状態 + エラー status を保持して早期リターンし、上記 3 件を一括で防ぐ。
+        currentHtml = '';
+        titleEl.textContent = 'Artifact Viewer';
+        document.title = 'Artifact Viewer';
+        frame.srcdoc = renderEmptyState();
+        lastContentHash = raw;
+        setBusy(false);
+        return;
       }
     } else {
       html = decodeHashHtml(raw);
@@ -1046,7 +1205,7 @@
    * 名前付きカラーなど）は canvas の fillStyle 正規化を介して rgb 文字列に揃えてから
    * 再パースする。これにより Tailwind CSS 4 などが既定で出力する oklch カラーも PPTX に
    * 反映される。以前は rgb() 以外をすべて null 扱いにしていたため、モダンアーティファクトで
-   * PPTX の色が一斉に拜える事故が起きる。
+   * PPTX の色が一斉に化ける事故が起きる。
    */
   const _colorNormCanvas = (() => {
     try { return document.createElement('canvas').getContext('2d'); }
@@ -1059,19 +1218,33 @@
     let m = s.match(RGB_RE);
     if (!m && _colorNormCanvas) {
       try {
-        // 不正な色文字列が代入されたときに前回値が残ると「不正」を「センチネル色」と誤認
-        // してしまうため、代入前に実コードでほぼ使われないセンチネルを置いて検出する。
-        // ただし fillStyle の読み返し形式はブラウザ依存で、CSS Color Level 4 以降では
-        // '#01020a' を代入しても 'rgb(1, 2, 10)' という文字列で返される可能性があるため、
-        // ハードコードではなく「代入直後に読み戻した値」をセンチネルとして使う。
-        // これをせず '#01020a' との直接比較にしていると、上記ブラウザでは
-        // 「不正な色 → norm='rgb(1, 2, 10)' ≡ センチネルだが文字列不一致」と誤判定され、
-        // センチネル色を「有効なユーザ指定色」として PPTX に間違った色が出る。
+        // 二段ベースライン方式で「不正な色」を判定する。
+        //   問題: 1 つのベースライン (#01020a) との比較だけだと、ユーザ色がたまたま
+        //         そのベースラインの正規化形 (例: '#01020a' そのもの、'rgb(1, 2, 10)') と
+        //         一致した場合に「不正」と誤判定し、有効な色を null として捨ててしまう。
+        //         これで PPTX 色が一部のスライドで反映されなくなる事故が起きうる。
+        //   対策: 異なる 2 色のベースラインで順に試行する。s が片方のベースラインと
+        //         衝突しても、もう片方では fillStyle が更新されるため確実に判定できる。
+        //   なお fillStyle の読み返し形式はブラウザ依存で、CSS Color Level 4 以降では
+        //   '#01020a' を代入しても 'rgb(1, 2, 10)' という文字列で返される可能性があるため、
+        //   ハードコード文字列ではなく「代入直後に読み戻した値」をセンチネルとして使う。
+        let norm = null;
         _colorNormCanvas.fillStyle = '#01020a';
-        const sentinel = String(_colorNormCanvas.fillStyle);
+        const sent1 = String(_colorNormCanvas.fillStyle);
         _colorNormCanvas.fillStyle = s;
-        const norm = String(_colorNormCanvas.fillStyle);
-        if (norm !== sentinel) {
+        const norm1 = String(_colorNormCanvas.fillStyle);
+        if (norm1 !== sent1) {
+          norm = norm1;
+        } else {
+          // norm1 === sent1: s は不正 OR s の正規化形が偶然 sent1 と一致。
+          // 別ベースラインで再試行し、更新されれば s は有効と確定する。
+          _colorNormCanvas.fillStyle = '#fdfefe';
+          const sent2 = String(_colorNormCanvas.fillStyle);
+          _colorNormCanvas.fillStyle = s;
+          const norm2 = String(_colorNormCanvas.fillStyle);
+          if (norm2 !== sent2) norm = norm2;
+        }
+        if (norm) {
           m = norm.match(RGB_RE);
           if (!m) {
             const hexm = norm.match(/^#([0-9a-fA-F]{6})$/);
@@ -1105,8 +1278,8 @@
     const walk = (node, ctx) => {
       if (node.nodeType === 3) {
         // HTML の空白圧縮ルールに合わせ、改行・連続空白を 1 個のスペースに畳む。
-        // これをしないと `<h1>foo</h1>\n<p>bar</p>` の `\n` がランとして PPTX に輸出され、
-        // 見出し前後に記述可能なデカい余白が出る。また、空白のみのランは、直前のランが
+        // これをしないと `<h1>foo</h1>\n<p>bar</p>` の `\n` がランとして PPTX に出力され、
+        // 見出し前後に意図しない大きな余白が出る。また、空白のみのランは、直前のランが
         // 既に空白で終わっている・改行 (breakLine) になっているときは捨てる。
         let t = node.textContent;
         if (!t) return;
@@ -1127,7 +1300,7 @@
       }
       const cs = win.getComputedStyle(node);
       // opacity=0 で隠している要素 (Tailwind の `opacity-0` クラス、トースト、ツールチップ等)
-      // も PPTX には出さないようスキップする。これをしないとタッチダウンやホバー表示の
+      // も PPTX には出さないようスキップする。これをしないとドロップダウンやホバー表示の
       // テキストがスライド本体に紛れ込む。
       if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return;
       // ブロックレベル要素の前にbreakLineを挿入（連続テキストを行で区切る、ルートはruns=0で自然にスキップ）
@@ -1703,7 +1876,9 @@
       setTimeout(() => { shortenBtn.textContent = original; }, 1500);
       const ctags = [format];
       if (dict) ctags.push('A3');
-      if (customDictVersion > 0) ctags.push('dict-v' + customDictVersion);
+      if (customDictVersion === 6) ctags.push('dyn-v6');
+      else if (customDictVersion === 7) ctags.push('sdht-v7');
+      else if (customDictVersion > 0) ctags.push('dict-v' + customDictVersion);
       const tag = ctags.join('+');
       setStatus('Short URL copied (' + tag + ', ' + formatBytes(baselineLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
     } catch (e) {
