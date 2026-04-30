@@ -223,6 +223,20 @@
       let s = css.replace(/\/\*[\s\S]*?\*\//g, '');
       s = s.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
       s = s.replace(/\s*\{\s*/g, '{').replace(/;\s*}\s*/g, '}').replace(/\s*}\s*/g, '}');
+      // プロパティ宣言のコロン後スペース除去 (font-weight: bold → font-weight:bold)
+      // これがないと後続の font-weight:bold→700 や 0px→0 等の短縮が空白付きCSSにマッチしない
+      s = s.replace(/:\s+/g, ':');
+      // セミコロン前の空白除去 (color: red ; → color:red;)
+      s = s.replace(/\s+;/g, ';');
+      // #rrggbb → #rgb shorthand (e.g. #ffffff → #fff)
+      s = s.replace(/#([0-9a-fA-F])\1([0-9a-fA-F])\2([0-9a-fA-F])\3\b/g, '#$1$2$3');
+      // 0px/0em/etc → 0 (unitless zero is valid for CSS lengths)
+      s = s.replace(/\b0+(\.0+)?(px|em|rem|vh|vw|vmin|vmax|ch|ex)\b/g, '0');
+      // 0.5 → .5 (leading zero removal)
+      s = s.replace(/\b0\.(\d)/g, '.$1');
+      // font-weight shorthand (bold→700, normal→400)
+      s = s.replace(/font-weight:bold\b/g, 'font-weight:700');
+      s = s.replace(/font-weight:normal\b/g, 'font-weight:400');
       return preserve(o + s + c);
     });
     // HTML コメント除去（条件付きコメントは保持）
@@ -234,6 +248,18 @@
     work = work.replace(/ type=["']text\/css["']/gi, '');
     // Boolean 属性を短縮 (checked="checked" → checked)
     work = work.replace(/ (checked|disabled|readonly|required|autofocus|autoplay|controls|defer|async|hidden|multiple|selected|novalidate)=["'][^"']*["']/gi, ' $1');
+    // オプショナル閉じタグを除去（HTML仕様で省略可能、ブラウザは正しくパースする）
+    // </p> はブロック要素が続く場合のみ安全に省略可能（インライン要素が続くと DOM 構造が変わる）
+    work = work.replace(/<\/p>(?=<(?:p|div|h[1-6]|ul|ol|dl|table|blockquote|pre|hr|section|article|aside|nav|header|footer|main|form|fieldset|figure|figcaption|details|address|menu|hgroup)\b)/gi, '');
+    // </li>, </td>, </th>, </tr> 等は後続の兄弟タグや親閉じタグで自動クローズされる
+    work = work.replace(/<\/(?:li|td|th|tr|dt|dd|option|colgroup|thead|tbody|tfoot)>/gi, '');
+    // 構造タグの閉じタグを除去（</html>, </head>, </body> は常に省略可能）
+    work = work.replace(/<\/(?:html|head|body)>/gi, '');
+    // 属性値の引用符を省略（値が英数字・ハイフン・ドット・アンダースコアのみの場合）
+    work = work.replace(/=["']([a-zA-Z0-9_\-\.]+)["']/g, '=$1');
+    // デフォルト type 属性を除去（button の submit と input の text はデフォルト値）
+    work = work.replace(/(<button\b[^>]*?) type=submit/gi, '$1');
+    work = work.replace(/(<input\b[^>]*?) type=text/gi, '$1');
     // マーカー復元
     const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
     work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
@@ -247,14 +273,14 @@
    * トークンは互いに部分一致しないように選定（split/join はメタ文字を気にせず確実に置換できる）。
    */
   const DICT_TOKENS = [
-    '<meta name="viewport" content="width=device-width,initial-scale=1.0">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<meta charset="UTF-8">',
-    '<meta charset="utf-8">',
+    '<meta name=viewport content="width=device-width,initial-scale=1.0">',
+    '<meta name=viewport content="width=device-width,initial-scale=1">',
+    '<meta charset=UTF-8>',
+    '<meta charset=utf-8>',
     '<!DOCTYPE html>',
     '<!doctype html>',
-    '<html lang="ja">',
-    '<html lang="en">',
+    '<html lang=ja>',
+    '<html lang=en>',
     'justify-content:',
     'background-color:',
     'border-radius:',
@@ -405,9 +431,47 @@
     + 'function(){return}const =>{Math.floor(Math.random()*'
     + 'JSON.stringify(JSON.parse(console.log("'
     + '<\/script><\/body><\/html>';
+  // V2: minifyHtml 強化後のパターン（引用符省略・オプショナルタグ除去・CSS短縮後の形式）
+  const CUSTOM_DICT_V2 = '<!DOCTYPE html><html lang=en><head><meta charset=UTF-8>'
+    + '<meta name=viewport content="width=device-width,initial-scale=1">'
+    + '<title></title><style>*{box-sizing:border-box;margin:0;padding:0}'
+    + 'body{font-family:system-ui,-apple-system,sans-serif;line-height:1.5;color:#333;background:#fff}'
+    + '.container{max-width:1200px;width:100%;margin:0 auto;padding:0 20px}'
+    + 'display:flex;align-items:center;justify-content:center;justify-content:space-between;'
+    + 'flex-direction:column;flex-direction:row;position:relative;position:absolute;'
+    + 'font-size:16px;font-size:14px;font-size:24px;font-size:12px;font-size:20px;'
+    + 'font-weight:700;font-weight:600;font-weight:400;'
+    + 'text-align:center;text-align:left;color:#333;color:#666;color:#fff;color:inherit;'
+    + 'background-color:#fff;background-color:#f5f5f5;background-color:transparent;'
+    + 'border-radius:8px;border-radius:4px;border-radius:12px;border-radius:50%;'
+    + 'padding:4px;padding:8px;padding:12px;padding:16px;padding:20px;padding:24px;'
+    + 'margin:0 auto;margin:0;margin-bottom:;margin-top:;'
+    + 'width:100%;height:100%;max-width:;min-height:100vh;overflow:hidden;overflow:auto;'
+    + 'border:none;border:1px solid #ddd;border:1px solid #eee;border-bottom:1px solid;'
+    + 'box-shadow:0 2px 4px rgba(0,0,0,.1);box-shadow:0 4px 6px rgba(0,0,0,.1);'
+    + 'transition:all .3s ease;transition:all .2s;transform:translateX(;transform:translateY(;'
+    + 'opacity:0;opacity:1;cursor:pointer;gap:4px;gap:8px;gap:12px;gap:16px;gap:24px;'
+    + 'z-index:;white-space:nowrap;text-overflow:ellipsis;text-decoration:none;'
+    + 'display:grid;display:none;flex-wrap:wrap;list-style:none;border-collapse:collapse;'
+    + 'grid-template-columns:;@media(max-width:768px){</style><body>'
+    + '<div class="container"><div class=""><span class=""><button class="">'
+    + '<a href="#" class=""><img src="" alt=""><input class="">'
+    + '<h1 class=""><h2 class=""><h3 class=""><p class=""><section class="">'
+    + '</div></span></button></a></ul></h1></h2></h3></section></header></footer>'
+    + '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill=none '
+    + 'stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round>'
+    + '<path d="M</svg>'
+    + 'addEventListener("DOMContentLoaded",function(){'
+    + 'addEventListener("click",function(e){e.preventDefault();'
+    + 'document.querySelector(".document.querySelectorAll(".'
+    + 'document.getElementById("classList.add("classList.remove("'
+    + 'style.display="innerHTML="textContent="'
+    + 'function(){return}const =>{Math.floor(Math.random()*'
+    + 'JSON.stringify(JSON.parse(console.log("'
+    + '<\/script>';
   // バージョン管理配列: index=バージョン番号。0=辞書なし。新辞書は末尾に append するだけ。
-  const CUSTOM_DICTS = [null, CUSTOM_DICT_V1];
-  const CURRENT_DICT_VERSION = 1;
+  const CUSTOM_DICTS = [null, CUSTOM_DICT_V1, CUSTOM_DICT_V2];
+  const CURRENT_DICT_VERSION = 2;
   /** 辞書をデータ先頭に付加 */
   const dictPrefixApply = (text, version) => {
     const dict = CUSTOM_DICTS[version];
