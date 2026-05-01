@@ -813,6 +813,114 @@
   };
 
   // ============================================================
+  // Paste-to-shorten flow
+  //   空状態画面の <textarea> から呼ばれる。アドレスバーに貼ると URI Too Long に
+  //   なるほど長いURLや、生HTMLをその場で圧縮して短縮URLとして開く。
+  //   外部送信は一切なし (compressHtml の中で CompressionStream / brotli-wasm /
+  //   LZMA-JS を使う既存パスをそのまま流用)。
+  // 受理する入力:
+  //   1. https?://.../#<生HTML>             → URLを parse し、hash を decodeHashHtml して圧縮
+  //   2. https?://.../#<圧縮済プレフィックス>=...  → 復号して再圧縮、短くなれば置換 (劣化はしない)
+  //   3. #<生HTML> または #<prefix>=<payload>  → 1/2 と同様
+  //   4. それ以外の文字列                     → 生HTML として圧縮
+  //
+  // (2) の再圧縮について: 古い辞書バージョン (V0/V5) で生成された URL や、当時無効だった
+  //   V6/V7 が今なら効くケースで数十%短くできることがある。再圧縮しても短くならなかった
+  //   場合は元のhashをそのまま採用するため、劣化は起きない。展開不可形式 (zstd 非対応ブラウザ等)
+  //   は再評価をスキップしてそのまま開く。
+  // ============================================================
+  window.uatProcessPaste = async (input) => {
+    if (!input || typeof input !== 'string') throw new Error('入力が文字列ではありません');
+    const trimmed = input.trim();
+    if (!trimmed) throw new Error('入力が空です');
+
+    // URL parse を試みる。成功したら fragment を抽出、さもなくば # プリフィックスをチェック、
+    // どちらでもなければ生HTML扱いとする。
+    let hashPart = null;
+    let urlObj = null;
+    try { urlObj = new URL(trimmed); } catch (e) { /* not a URL */ }
+    if (urlObj) {
+      hashPart = urlObj.hash ? urlObj.hash.slice(1) : '';
+      if (!hashPart) throw new Error('URL に # 以降のコンテンツがありません');
+    } else if (trimmed.charAt(0) === '#') {
+      hashPart = trimmed.slice(1);
+    }
+
+    let html;
+    let originalHashContent = null; // 既存の短縮URLが渡された場合: 再圧縮で短くならなければこれをそのまま採用
+    if (hashPart !== null) {
+      if (SHORT_URL_HASH_RE.test(hashPart)) {
+        // 既存の短縮URL → 復号して再圧縮、短くなれば置換
+        setBusy(true);
+        setStatus('decompressing existing short URL...');
+        const m = hashPart.match(SHORT_URL_HASH_RE);
+        const cdv = m[1] ? parseInt(m[1], 10) : 0;
+        const prefixChar = m[2];
+        const fmt = FORMAT_BY_PREFIX[prefixChar];
+        const dictApplied = (prefixChar === prefixChar.toUpperCase());
+        const payload = m[3];
+        // ブラウザ側で展開できない形式 (zstd 非対応の Chrome 等) は再評価できないので
+        // そのまま開く。再圧縮しないだけで URL の解釈は render() 側で行うため動作には影響しない。
+        const isStreamFmt = (fmt !== 'lzma');
+        const hasFallbackDecompress = (fmt === 'brotli');
+        if (isStreamFmt && !hasFallbackDecompress && (!compressionSupported || !decompressSupport[fmt])) {
+          setStatus('opening short URL (cannot re-evaluate on this browser)...');
+          if (location.hash === '#' + hashPart) render();
+          else location.hash = '#' + hashPart;
+          return;
+        }
+        try {
+          html = await decompressHtml(fmt, payload, dictApplied, cdv);
+        } catch (e) {
+          setBusy(false);
+          setStatus('decompress failed: ' + (e && e.message ? e.message : e));
+          throw e;
+        }
+        originalHashContent = hashPart;
+      } else {
+        html = decodeHashHtml(hashPart);
+      }
+    } else {
+      html = trimmed; // URLでも # でもない → 生HTML 扱い
+    }
+    if (!html) throw new Error('内容が空です');
+
+    setBusy(true);
+    setStatus(originalHashContent ? 're-compressing for potential improvement...' : 'compressing pasted content...');
+    try {
+      const result = await compressHtml(html);
+      const newHashContent = result.prefix + '=' + result.payload;
+      // 既存の短縮URLが渡された場合のみ「短くなったかどうか」を判定する。
+      // 同等以下なら元のhashをそのまま採用 (劣化を防ぐ)。生HTMLからの圧縮には比較対象がない
+      // のでそのまま new を採用する。
+      let finalHash;
+      if (originalHashContent && originalHashContent.length <= newHashContent.length) {
+        finalHash = '#' + originalHashContent;
+        console.info('[url-to-artifact] re-compress did not improve: kept original ('
+          + originalHashContent.length + ' chars; re-compress would be '
+          + newHashContent.length + ')');
+      } else {
+        finalHash = '#' + newHashContent;
+        if (originalHashContent) {
+          const saved = originalHashContent.length - newHashContent.length;
+          const pct = (saved / originalHashContent.length * 100).toFixed(1);
+          console.info('[url-to-artifact] re-compress saved ' + saved + ' chars ('
+            + pct + '%; ' + originalHashContent.length + '→' + newHashContent.length + ')');
+        }
+      }
+      if (location.hash === finalHash) {
+        render();
+      } else {
+        location.hash = finalHash;
+      }
+    } catch (e) {
+      setBusy(false);
+      setStatus('shorten failed: ' + (e && e.message ? e.message : e));
+      throw e; // iframe 側でエラー表示させるため re-throw
+    }
+  };
+
+  // ============================================================
   // Renderers (iframe srcdoc 内容)
   // ============================================================
   const renderEmptyState = () => {
@@ -820,19 +928,58 @@
     return '<!doctype html><meta charset=utf-8>'
       + '<style>body{font:14px/1.6 system-ui,-apple-system,sans-serif;padding:2em;max-width:680px;margin:auto;color:#333}'
       + 'h2{font-size:1.2em;margin-top:0}'
+      + 'h3{font-size:1em;margin:0 0 .5em}'
       + 'code{background:#f4f4f4;padding:.1em .4em;border-radius:3px;font-size:.9em}'
       + 'pre{background:#f4f4f4;padding:1em;border-radius:6px;overflow:auto;font-size:12px;line-height:1.4;white-space:pre-wrap;word-break:break-all}'
-      + '.note{color:#666;font-size:13px;margin-top:1.5em}</style>'
+      + '.note{color:#666;font-size:13px;margin-top:1.5em}'
+      + '.paste-zone{margin:1.5em 0;padding:1em;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa}'
+      + '.paste-zone p{font-size:12px;color:#57606a;margin:.3em 0 .8em}'
+      + '.paste-zone textarea{width:100%;min-height:80px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;box-sizing:border-box;padding:.5em;border:1px solid #d0d7de;border-radius:4px;resize:vertical;background:#fff;color:#222}'
+      + '.paste-zone .row{display:flex;gap:.5em;align-items:center;margin-top:.5em;flex-wrap:wrap}'
+      + '.paste-zone button{padding:.4em 1em;font:inherit;background:#0969da;color:#fff;border:0;border-radius:4px;cursor:pointer}'
+      + '.paste-zone button:hover:not(:disabled){background:#0860c7}'
+      + '.paste-zone button:disabled{opacity:.6;cursor:wait}'
+      + '.paste-zone .err{color:#cf222e;font-size:12px}'
+      + '.paste-zone .ok{color:#1a7f37;font-size:12px}</style>'
       + '<body><h2>Artifact Viewer</h2>'
       + '<p>このページのURLの <code>#</code> 以降にHTMLを書くと、ここに表示されます。</p>'
       + '<p>例:</p><pre>' + escapeHtml(sample) + '</pre>'
+      + '<div class="paste-zone">'
+      + '<h3>長すぎるURL / 生HTML を貼って短縮</h3>'
+      + '<p>アドレスバーに貼ると <code>URI Too Long</code> になるような長いURL、または生HTMLをここに貼り付けると、その場で圧縮して短縮URLとして開けます。外部送信は一切ありません。Cmd/Ctrl+Enter で送信。</p>'
+      + '<textarea id="paste-input" placeholder="https://..../url-to-artifact/#&lt;!doctype html&gt;...   または生のHTML"></textarea>'
+      + '<div class="row"><button id="paste-submit">短縮して開く</button>'
+      + '<span id="paste-msg"></span></div>'
+      + '</div>'
       + '<p>ツールバーから HTML / PNG / PDF / PPTX として保存できます。</p>'
       + '<div class="note"><p><strong>注意点</strong></p><ul>'
       + '<li>HTML中に <code>#</code> を含める場合のみ <code>%23</code> に置換（その他はブラウザが自動エンコード）</li>'
-      + '<li>URL長は数十KBが実用上限（Chrome 約 32KB / Firefox 64KB / Safari 約 80KB）</li>'
+      + '<li>URL長は数十KBが実用上限（Chrome 約 32KB / Firefox 64KB / Safari 約 80KB）。これを超える場合は上の貼付欄から短縮URL化できます。</li>'
       + '<li>PNG / PDF / PPTX は外部ライブラリ（html2canvas, jsPDF, pptxgenjs, JSZip）をCDN経由で読み込みます</li>'
       + '<li>スライド構造を検出した場合 PNGはZIP · PDF/PPTXは多ページとして出力</li>'
-      + '</ul></div></body>';
+      + '</ul></div>'
+      + '<script>(function(){'
+      + 'var btn=document.getElementById("paste-submit");'
+      + 'var input=document.getElementById("paste-input");'
+      + 'var msg=document.getElementById("paste-msg");'
+      + 'function setMsg(t,c){msg.textContent=t||"";msg.className=c||"";}'
+      + 'async function submit(){'
+        + 'setMsg("");'
+        + 'var v=input.value;'
+        + 'if(!v||!v.trim()){setMsg("入力が空です","err");return;}'
+        + 'btn.disabled=true;var orig=btn.textContent;btn.textContent="処理中...";'
+        + 'try{'
+          + 'if(!parent||typeof parent.uatProcessPaste!=="function"){throw new Error("ページの初期化が完了していません");}'
+          + 'await parent.uatProcessPaste(v);'
+        + '}catch(e){'
+          + 'setMsg((e&&e.message)||String(e),"err");'
+          + 'btn.disabled=false;btn.textContent=orig;'
+        + '}'
+      + '}'
+      + 'btn.addEventListener("click",submit);'
+      + 'input.addEventListener("keydown",function(e){if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){e.preventDefault();submit();}});'
+      + '})();<\/script>'
+      + '</body>';
   };
 
   /**
