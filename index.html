@@ -43,8 +43,29 @@
 <script src="dicts.js"></script>
 <script src="dynamic-dict.js"></script>
 <script src="sdht.js"></script>
+<script src="uat-codec.js"></script>
+<script src="uat-export.js"></script>
 <script>
 (() => {
+  // ============================================================
+  // 本ファイルは DOM 参照・UI 状態・描画・ペースト処理・イベント結線のみを担当する。
+  //   - 圧縮・展開ロジック  → uat-codec.js  (window.UAT_CODEC)
+  //   - HTML/PNG/PDF/PPTXエクスポート → uat-export.js (window.UAT_EXPORT)
+  // 3 つのファイルは全て同ディレクトリにホスティングされる前提。
+  // ============================================================
+  const C = window.UAT_CODEC;
+  if (!C) {
+    console.error('[url-to-artifact] uat-codec.js failed to load; viewer cannot start');
+    return;
+  }
+  const {
+    compressHtml, decompressHtml,
+    SHORT_URL_HASH_RE, FORMAT_BY_PREFIX,
+    compressionSupported, decompressSupport,
+    loadScript, URLS, loadBrotliWasm,
+    extractTitle, sanitizeFilename, formatBytes
+  } = C;
+
   const $ = (id) => document.getElementById(id);
   const frame = $('frame');
   const titleEl = $('title');
@@ -59,51 +80,13 @@
   let currentHtml = '';
 
   // ============================================================
-  // Utilities
+  // UI utilities
   // ============================================================
   const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 
-  // 主要 HTML エンティティを文字に戻す。タイトル抽出やファイル名生成で使い、
-  // `<title>Foo &amp; Bar</title>` を `Foo & Bar` として表示する（これをしないと
-  // ブラウザタブ、ファイル名、PPTX タイトルに `&amp;` `&#x3042;` といった
-  // 実体参照がそのまま残る）。`&amp;` は二重デコード防止のため最後に処理する。
-  const decodeHtmlEntities = (s) => String(s)
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => {
-      const cp = parseInt(n, 10);
-      // cp > 0x10FFFF など無効なコードポイントで fromCodePoint が RangeError を投げるのを防ぎ、
-      // 元の文字参照をそのまま残す。
-      try { return Number.isFinite(cp) ? String.fromCodePoint(cp) : _; }
-      catch (e) { return _; }
-    })
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
-      const cp = parseInt(n, 16);
-      try { return Number.isFinite(cp) ? String.fromCodePoint(cp) : _; }
-      catch (e) { return _; }
-    })
-    .replace(/&amp;/g, '&');
-
-  const extractTitle = (html) => {
-    const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    return m ? decodeHtmlEntities(m[1].trim()) : null;
-  };
-
-  const sanitizeFilename = (name) =>
-    String(name).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim().slice(0, 200) || 'artifact';
-
   const baseFilename = () => sanitizeFilename(extractTitle(currentHtml) || 'artifact');
-
-  const formatBytes = (n) => {
-    if (n < 1024) return n + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    return (n / (1024 * 1024)).toFixed(2) + ' MB';
-  };
 
   const setStatus = (msg) => { statusEl.textContent = msg || ''; };
 
@@ -116,53 +99,6 @@
   };
   const hideProgress = () => { progressEl.hidden = true; progressBar.style.width = '0'; };
 
-  // CompressionStream API はモダンブラウザでサポート（Compression Streams API: Chrome 80+ / Edge 80+ / Firefox 113+ / Safari 16.4+）
-  const compressionSupported = typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
-
-  /**
-   * 短縮URL用に試行する圧縮形式の定義。試行順 = 同点時の優先順。
-   *   zstd       : Firefox 149+ のみ CompressionStream API 対応。HTML系で brotli と同等以上に縮むことがある
-   *   brotli     : Chrome 144+ / Edge 144+ / Firefox 147+ / Safari 19+。HTML/CSS/JS で gzip より 15〜25% 短くなる
-   *   deflate-raw: 全主要ブラウザで対応。gzip と同じDEFLATE圧縮だがヘッダなしで約 18 バイト短い
-   *   gzip       : 全主要ブラウザで対応。互換性のため残す（実質 deflate-raw に劣後）
-   *   lzma       : LZMA-JS (CDN遅延ロード)。HTML/CSS/JS で brotli より 5〜15% 縮むことがあるが、圧縮時間は数秒オーダー
-   * CompressionStream 系は圧縮側と展開側で個別判定。LZMA は外部ライブラリなので別管理。
-   */
-  const SHORT_URL_FORMATS_NATIVE = [
-    { prefix: 's', format: 'zstd' },
-    { prefix: 'b', format: 'brotli' },
-    { prefix: 'd', format: 'deflate-raw' },
-    { prefix: 'z', format: 'gzip' }
-  ];
-  const detectFormat = (Ctor, format) => {
-    if (!compressionSupported) return false;
-    try { new Ctor(format); return true; } catch (e) { return false; }
-  };
-  const compressSupport = {};
-  const decompressSupport = {};
-  SHORT_URL_FORMATS_NATIVE.forEach(({ format }) => {
-    compressSupport[format] = detectFormat(CompressionStream, format);
-    decompressSupport[format] = detectFormat(DecompressionStream, format);
-  });
-  // 全候補（CompressionStream 系 + LZMA）。LZMA は実行時に CDN ロード後に使用可能。
-  const SHORT_URL_FORMATS_ALL = SHORT_URL_FORMATS_NATIVE.concat([{ prefix: 'l', format: 'lzma' }]);
-  // プレフィックス → format マップ。小文字 = 辞書なし(v1)、大文字 = 辞書あり(v2, A-3 適用)。
-  // 既存の v1 (`#b=...` 等) と互換性を保ちつつ、新規生成は最短採用方式で v1/v2 のどちらかになる。
-  const FORMAT_BY_PREFIX = {};
-  SHORT_URL_FORMATS_ALL.forEach(({ prefix, format }) => {
-    FORMAT_BY_PREFIX[prefix] = format;                  // v1: 辞書なし
-    FORMAT_BY_PREFIX[prefix.toUpperCase()] = format;    // v2: 辞書あり
-  });
-  /**
-   * 短縮URLのハッシュ部分を拾う正規表現。
-   * プレフィックス形式: [<digit>]<letter>  digit=カスタム辞書バージョン(省略=なし), letter=圧縮形式
-   *   小文字 (b/z/d/s/l) = A-3 辞書なし、大文字 (B/Z/D/S/L) = A-3 辞書あり
-   *   数字プレフィックス (1b, 1B 等) = カスタム辞書プレフィックス v1〜 適用
-   */
-  // version プレフィックスは複数桁許容 (\d*)。CURRENT_DICT_VERSION が 10 を超えても動くよう、
-  // 将来の辞書追加に備えて多桁対応にしておく。なお customDictVersion=0 (辞書なし) は数字なし表記。
-  const SHORT_URL_HASH_RE = /^(\d*)([bzdslBZDSL])=([A-Za-z0-9_-]+)$/;
-
   /** busy=true で全ボタン無効、false で復帰（エクスポート系・Copy Short URL はアーティファクト未ロード時は無効のまま） */
   const setBusy = (busy) => {
     document.body.classList.toggle('busy', !!busy);
@@ -173,17 +109,6 @@
     // 全形式が失敗した場合のみ compressHtml が throw してエラー表示になる。
     shortenBtn.disabled = !!busy || !hasArtifact;
     if (!busy) hideProgress();
-  };
-
-  /** Promise にタイムアウトを付与。ms 以内に resolve/reject しなければ Error で reject する。
-   *  元 Promise が先に settle した場合はタイマーを即座にクリアし、
-   *  不要な reject による unhandledrejection イベントの発生を防ぐ。 */
-  const withTimeout = (promise, ms, label) => {
-    let timer;
-    const timeout = new Promise((_, rej) => {
-      timer = setTimeout(() => rej(new Error((label || 'operation') + ' timed out (' + (ms / 1000) + 's)')), ms);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   };
 
   const downloadBlob = (blob, filename) => {
@@ -202,615 +127,19 @@
   });
 
   // ============================================================
-  // HTML 前処理: A-1 ミニファイ + A-3 静的辞書置換
-  //   いずれも圧縮前のオプション処理。A-1 は表示上等価なので decoder 不要、
-  //   A-3 はプレフィックスが大文字の場合のみ逆処理を実行する。
+  // Exporters (uat-export.js から取得)
   // ============================================================
-
-  /**
-   * A-1: HTML ミニファイ。表示結果を変えない範囲で空白とコメントを削減する。
-   *   - HTML コメントを除去（条件付きコメント `<!--[if IE]>` は保持）
-   *   - 連続空白を 1 個のスペースに圧縮 / タグ境界の空白を除去
-   *   - <pre> / <textarea> / <script> / <style> / <code> の内部はユニークマーカーで退避して完全保護
-   */
-  const minifyHtml = (html) => {
-    const preserved = [];
-    const marker = 'UATPRES' + Math.random().toString(36).slice(2, 10) + 'X';
-    const preserve = (m) => { const t = marker + preserved.length + 'X'; preserved.push(m); return t; };
-    let work = html;
-    // pre/textarea/code はそのまま保護
-    work = work.replace(/<(pre|textarea|code)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, preserve);
-    // <script> を <style> より先に保護する。これにより JS 文字列中に含まれる
-    // `<style>...</style>` が CSS ミニファイ対象にならず、JS コードが壊れない。
-    work = work.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, preserve);
-    // <style> 内 CSS をミニファイしてから保護
-    work = work.replace(/(<style[^>]*>)([\s\S]*?)(<\/style>)/gi, (_, o, css, c) => {
-      // CSS 中の引用符付き文字列 ("..." / '...') を退避してから minify ルールを適用する。
-      // これをしないと content:"Hello, world" のような疑似要素テキスト、font-family:"Foo 0.5"
-      // のような特殊フォント名、attr() のフォールバック文字列等の中身が、コンマ畳み込み・
-      // 0px→0・0.5→.5・hex短縮・rgba 正規化等によって書き換えられて表示が崩れる。
-      // バックスラッシュエスケープ (\" \') を含む文字列にも対応。
-      const cssStrings = [];
-      const cssMarker = 'UATCSS' + Math.random().toString(36).slice(2, 10) + 'X';
-      let s = css.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => {
-        const t = cssMarker + cssStrings.length + 'X';
-        cssStrings.push(m);
-        return t;
-      });
-      s = s.replace(/\/\*[\s\S]*?\*\//g, '');
-      s = s.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
-      s = s.replace(/\s*\{\s*/g, '{').replace(/;\s*}\s*/g, '}').replace(/\s*}\s*/g, '}');
-      // プロパティ宣言のコロン後スペース除去 (font-weight: bold → font-weight:bold)
-      // これがないと後続の font-weight:bold→700 や 0px→0 等の短縮が空白付きCSSにマッチしない
-      s = s.replace(/:\s+/g, ':');
-      // セミコロン前の空白除去 (color: red ; → color:red;)
-      s = s.replace(/\s+;/g, ';');
-      // #rrggbb → #rgb shorthand (e.g. #ffffff → #fff)
-      s = s.replace(/#([0-9a-fA-F])\1([0-9a-fA-F])\2([0-9a-fA-F])\3\b/g, '#$1$2$3');
-      // 0px/0em/etc → 0 (unitless zero is valid for CSS lengths)
-      s = s.replace(/\b0+(\.0+)?(px|em|rem|vh|vw|vmin|vmax|ch|ex)\b/g, '0');
-      // 0.5 → .5 (leading zero removal)
-      s = s.replace(/\b0\.(\d)/g, '.$1');
-      // font-weight shorthand (bold→700, normal→400)
-      s = s.replace(/font-weight:bold\b/g, 'font-weight:700');
-      s = s.replace(/font-weight:normal\b/g, 'font-weight:400');
-      // rgb/rgba の固定パターンを短縮形へ変換。色値の冗長表記を1パターンに集約し辞書・LZマッチ効率を上げる。
-      // alpha=1 は #rrggbb 同等、alpha=0 は transparent 同等として安全。
-      s = s.replace(/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*1\s*\)/g, '#000');
-      s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*1\s*\)/g, '#fff');
-      s = s.replace(/rgba?\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/g, 'transparent');
-      s = s.replace(/rgba?\(\s*255\s*,\s*255\s*,\s*255\s*,\s*0\s*\)/g, 'transparent');
-      // margin/padding の同値ショートハンド。CSSは1値=全方向、3値 0 0 0 は上・左右・下として全て 0 なので 1値に集約可能。
-      s = s.replace(/\b(margin|padding):0 0 0 0\b/g, '$1:0');
-      s = s.replace(/\b(margin|padding):0 0 0\b(?![ \d])/g, '$1:0');
-      s = s.replace(/\b(margin|padding):0 0\b(?![ \d])/g, '$1:0');
-      // outline:none → outline:0 (1文字短縮)、border:none → border:0 (3文字短縮)
-      // background:none は border-image 付きショートハンドとは意味が違うため変換しない (安全側)。
-      s = s.replace(/\boutline:none\b/g, 'outline:0');
-      s = s.replace(/\bborder:none\b/g, 'border:0');
-      s = s.replace(/\bborder-(top|right|bottom|left):none\b/g, 'border-$1:0');
-      // 並んだセレクターコンマの前後空白を除去する (a , b → a,b)
-      s = s.replace(/\s*,\s*/g, ',');
-      // 閉じ括弧の前にある最後のプロパティの ; は不要 (color:red;} → color:red})
-      s = s.replace(/;}/g, '}');
-      // 退避した文字列を復元
-      const cssRestoreRe = new RegExp(cssMarker + '(\\d+)X', 'g');
-      s = s.replace(cssRestoreRe, (_, idx) => cssStrings[parseInt(idx, 10)] || '');
-      return preserve(o + s + c);
-    });
-    // HTML コメント除去（条件付きコメントは保持）
-    work = work.replace(/<!--([\s\S]*?)-->/g, (m, body) => /^\[if\b/i.test(body) ? m : '');
-    // 連続空白圧縮 / タグ境界の空白除去
-    work = work.replace(/\s+/g, ' ').replace(/>\s+</g, '><').trim();
-    // 冗長な type 属性を除去
-    work = work.replace(/ type=["']text\/javascript["']/gi, '');
-    work = work.replace(/ type=["']text\/css["']/gi, '');
-    // Boolean 属性を短縮 (checked="checked" → checked)
-    work = work.replace(/ (checked|disabled|readonly|required|autofocus|autoplay|controls|defer|async|hidden|multiple|selected|novalidate)=["'][^"']*["']/gi, ' $1');
-    // オプショナル閉じタグを除去（HTML仕様で省略可能、ブラウザは正しくパースする）
-    // </p> はブロック要素が続く場合のみ安全に省略可能（インライン要素が続くと DOM 構造が変わる）
-    work = work.replace(/<\/p>(?=<(?:p|div|h[1-6]|ul|ol|dl|table|blockquote|pre|hr|section|article|aside|nav|header|footer|main|form|fieldset|figure|figcaption|details|address|menu|hgroup)\b)/gi, '');
-    // </li>, </td>, </th>, </tr> 等は後続の兄弟タグや親閉じタグで自動クローズされる
-    work = work.replace(/<\/(?:li|td|th|tr|dt|dd|option|colgroup|thead|tbody|tfoot)>/gi, '');
-    // 構造タグの閉じタグを除去（</html>, </head>, </body> は常に省略可能）
-    work = work.replace(/<\/(?:html|head|body)>/gi, '');
-    // 属性値の引用符を省略（値が英数字・ハイフン・ドット・アンダースコアのみの場合）
-    work = work.replace(/=["']([a-zA-Z0-9_\-\.]+)["']/g, '=$1');
-    // デフォルト type 属性を除去（button の submit と input の text はデフォルト値）
-    work = work.replace(/(<button\b[^>]*?) type=submit/gi, '$1');
-    work = work.replace(/(<input\b[^>]*?) type=text/gi, '$1');
-    // HTML エンティティを短い形式に正規化。&apos; は HTML5 で初出だが &#39; は HTML4 も含め全ブラウザでサポートされており 1 文字短い。
-    // <pre>/<script>/<style>/<textarea>/<code> 内は preserve 済みなので、コード中の &apos; リテラルを誤って変換する事故は起きない。
-    work = work.replace(/&apos;/g, '&#39;');
-    // 属性のアルファベット順ソート（LZ系圧縮の繰り返しパターン増加目的）。
-    // pre/textarea/script/style/code は preserve 済みなので attrsStr にマーカー文字列が含まれることはない。
-    // case-insensitive ソートにより SVG の viewBox / preserveAspectRatio など大文字混じり属性も
-    // 周りの小文字属性と一貫した順序で並ぶ。重複属性（例: class=a class=b）はそのまま保持
-    // （実際には不正な HTML だが、ブラウザは先頭の値を採用するためソートしても意味を保つ）。
-    // outer regex は「タグ名 + 1個以上の属性 + (optional /) + >」を明示的にマッチさせる。
-    // 単に [^<>]*? にすると <a title="2 > 1"> のように引用符内の > でタグが切られて
-    // 属性値を損ねる事故が起きるため、引用あり値をクォート規則ではなくトークンレベルで認識させる。
-    work = work.replace(/<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[a-zA-Z_:][\w:.-]*(?:=(?:"[^"]*"|'[^']*'|[^\s"'`=<>]+))?)+)\s*(\/?)>/g, (match, tag, attrsStr, slash) => {
-      // 属性なし or 単一属性は変換不要。クォート/未クォート/値なしをすべてキャッチ。
-      const re = /([a-zA-Z_:][\w:.-]*)(?:=("[^"]*"|'[^']*'|[^\s"'`=<>\/]+))?/g;
-      const list = [];
-      let am;
-      while ((am = re.exec(attrsStr))) {
-        list.push({ name: am[1], value: am[2] });
-      }
-      if (list.length < 2) return match;
-      // 安定ソート（name が同じ場合は元順）にするため index を tiebreaker に使う。
-      const indexed = list.map((a, i) => ({ a, i }));
-      indexed.sort((x, y) => {
-        const xn = x.a.name.toLowerCase(), yn = y.a.name.toLowerCase();
-        if (xn < yn) return -1;
-        if (xn > yn) return 1;
-        return x.i - y.i;
-      });
-      return '<' + tag + indexed.map(({ a }) => ' ' + a.name + (a.value !== undefined ? '=' + a.value : '')).join('') + slash + '>';
-    });
-    // マーカー復元
-    const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
-    work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
-    return work;
-  };
-
-  /**
-   * A-3: 静的辞書置換。HTML で頻出する長いトークン（`<!DOCTYPE html>` 等）を、
-   * NUL/TAB/LF/CR を避けた 0x01-0x1F の制御文字 1 バイトに置換する。decoder は同じテーブルで逆処理する。
-   * 元 HTML がいずれかのセンチネル文字を既に含んでいる場合は適用不可（dictCanApply で判定）。
-   * トークンは互いに部分一致しないように選定（split/join はメタ文字を気にせず確実に置換できる）。
-   */
-  const DICT_TOKENS = [
-    // 属性は minifyHtml の最終ステップでアルファベット順にソートされるため、
-    // 辞書側も c < n の順 (content → name) で登録する必要がある。逆順にすると
-    // 入力 HTML 側に永久に一致せず A-3 静的辞書による圧縮が効かない。
-    '<meta content="width=device-width,initial-scale=1.0" name=viewport>',
-    '<meta content="width=device-width,initial-scale=1" name=viewport>',
-    '<meta charset=UTF-8>',
-    '<meta charset=utf-8>',
-    '<!DOCTYPE html>',
-    '<!doctype html>',
-    '<html lang=ja>',
-    '<html lang=en>',
-    'justify-content:',
-    'background-color:',
-    'border-radius:',
-    '<div class="',
-    'align-items:',
-    'font-weight:',
-    'text-align:',
-    'font-size:',
-    '</section>',
-    '<\/script>',
-    '</button>',
-    '<section ',
-    '<section>',
-    '</header>',
-    '<header>',
-    '<script>',
-    '</style>',
-    '<style>',
-    '</span>',
-    '</div>'
-  ];
-  const DICT_SENTINELS = (() => {
-    const arr = [];
-    for (let cc = 0x01; cc <= 0x1F && arr.length < DICT_TOKENS.length; cc++) {
-      if (cc === 0x09 || cc === 0x0A || cc === 0x0D) continue;
-      arr.push(String.fromCharCode(cc));
-    }
-    return arr;
-  })();
-  const DICT_PAIRS = DICT_TOKENS.slice(0, DICT_SENTINELS.length).map((tok, i) => [tok, DICT_SENTINELS[i]]);
-  const dictCanApply = (html) => {
-    for (const [, s] of DICT_PAIRS) if (html.indexOf(s) >= 0) return false;
-    return true;
-  };
-  const dictApply = (html) => {
-    let out = html;
-    for (const [tok, sen] of DICT_PAIRS) out = out.split(tok).join(sen);
-    return out;
-  };
-  const dictReverse = (html) => {
-    let out = html;
-    for (const [tok, sen] of DICT_PAIRS) out = out.split(sen).join(tok);
-    return out;
-  };
-
-  // ============================================================
-  // 圧縮 / 展開（Copy Short URL 用）
-  //   方針: HTML を A-1 ミニファイ → A-3 辞書ありなし両方トライ → 全形式 (zstd/brotli/deflate-raw/gzip/LZMA)
-  //         で並列圧縮 → 最短採用。プレフィックス小文字 = 辞書なし v1、大文字 = 辞書あり v2。
-  // ============================================================
-
-  /** Uint8Array → base64url（URL安全） */
-  const bytesToBase64Url = (bytes) => {
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  };
-  /** base64url → Uint8Array */
-  const base64UrlToBytes = (b64url) => {
-    let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = b64.length % 4;
-    if (pad) b64 += '='.repeat(4 - pad);
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  };
-
-  // ============================================================
-  // brotli-wasm (quality 11, CDN 遅延ロード)
-  //   CompressionStream('brotli') はデフォルト quality 4〜6 程度。brotli-wasm を
-  //   quality 11（最大）で使うと 10〜25% 追加圧縮が見込める。出力は標準 Brotli
-  //   ストリームのため DecompressionStream('brotli') で展開可能。非対応ブラウザ
-  //   では brotli-wasm 自体で展開にフォールバックする。
-  // ============================================================
-  // loadScript と同様に Promise をキャッシュし、並行呼び出し時の二重ロードを防止する。
-  // 失敗時はキャッシュを破棄してリトライ可能にする。
-  let _brotliWasmP = null;
-  const loadBrotliWasm = () => {
-    if (_brotliWasmP) return _brotliWasmP;
-    // loadScript と同様に 30 秒でタイムアウト。CDN がハングすると import() が永久に
-    // 解決されず、compressHtml の Promise.all や brotli フォールバック展開が固まるため。
-    _brotliWasmP = withTimeout((async () => {
-      const mod = await import('https://unpkg.com/brotli-wasm@3.0.0/index.web.js');
-      let brotli = mod.default || mod;
-      if (typeof brotli === 'function') brotli = await brotli();
-      if (brotli && typeof brotli.then === 'function') brotli = await brotli;
-      if (!brotli || typeof brotli.compress !== 'function') throw new Error('brotli-wasm: invalid module');
-      return brotli;
-    })(), 30000, 'brotli-wasm load').catch(e => { _brotliWasmP = null; throw e; });
-    return _brotliWasmP;
-  };
-  const compressBrotliWasm = async (text) => {
-    const brotli = await loadBrotliWasm();
-    const compressed = brotli.compress(new TextEncoder().encode(text), { quality: 11 });
-    return bytesToBase64Url(new Uint8Array(compressed));
-  };
-  const decompressBrotliWasm = async (b64url) => {
-    const brotli = await loadBrotliWasm();
-    const decompressed = brotli.decompress(base64UrlToBytes(b64url));
-    return new TextDecoder().decode(decompressed);
-  };
-
-  // ============================================================
-  // カスタム辞書圧縮 (バージョン管理・拡張可能設計)
-  //   圧縮前に HTML/CSS/JS/日本語頻出パターンの辞書文字列をデータ先頭に付加する。
-  //   LZ系圧縮のスライディングウィンドウ内に辞書パターンが配置されるため、
-  //   実データ中のマッチが後方参照で効率よく符号化され、圧縮率が改善される。
-  //   辞書本体 (V1, V2, V3, V4 …) は dicts.js に切り出されており、
-  //   window.UAT_DICTS = { CUSTOM_DICTS, CURRENT_DICT_VERSION } で公開される。
-  //   新バージョン追加は dicts.js の編集のみで完結し、index.html への変更は不要。
-  //   旧バージョンの辞書は削除しないため、過去の URL は常にデコード可能。
-  //   dicts.js のロード失敗時 (ネットワークエラー、blocker 等) は無辞書モードで
-  //   動作させる。圧縮率は下がるが、A-1 ミニファイと A-3 静的辞書の組み合わせは
-  //   引き続き機能するため、Copy Short URL 自体は常に動作する。
-  // ============================================================
-  const _UAT_DICTS = window.UAT_DICTS;
-  if (!_UAT_DICTS || !Array.isArray(_UAT_DICTS.CUSTOM_DICTS)) {
-    console.error('[url-to-artifact] dicts.js failed to load; custom dictionary compression disabled');
+  const E = window.UAT_EXPORT;
+  if (!E || typeof E.init !== 'function') {
+    console.error('[url-to-artifact] uat-export.js failed to load; export buttons disabled');
   }
-  const CUSTOM_DICTS = (_UAT_DICTS && _UAT_DICTS.CUSTOM_DICTS) || [null];
-  const CURRENT_DICT_VERSION = (_UAT_DICTS && typeof _UAT_DICTS.CURRENT_DICT_VERSION === 'number') ? _UAT_DICTS.CURRENT_DICT_VERSION : 0;
-
-  // ============================================================
-  // V6 動的辞書 (dynamic-dict.js)
-  //   コンテンツ依存辞書: 圧縮直前に HTML 本体から頻出 n-gram を抽出し、
-  //   V5 静的辞書 + 動的辞書 + 本体 の 3 段プレフィックスで圧縮する。
-  //   URL ペイロード先頭に varint で動的辞書長を埋め込み、デコーダはそれを
-  //   読み出して slice する。dynamic-dict.js のロードに失敗した場合は V6
-  //   バリアントを生成せず、V5 までで動作を継続する (URL 互換性に影響なし)。
-  // ============================================================
-  const _UAT_DYN = window.UAT_DYNAMIC_DICT;
-  if (!_UAT_DYN || typeof _UAT_DYN.buildDictionary !== 'function') {
-    console.warn('[url-to-artifact] dynamic-dict.js not loaded; V6 dynamic dictionary disabled');
-  }
-  const DYNAMIC_DICT_AVAILABLE = !!(_UAT_DYN
-    && typeof _UAT_DYN.buildDictionary === 'function'
-    && typeof _UAT_DYN.chooseBudget === 'function'
-    && typeof _UAT_DYN.varintEncode === 'function'
-    && typeof _UAT_DYN.varintDecode === 'function');
-  // V6 は常に V5 静的辞書 + 動的辞書の組み合わせ。将来 V7 静的辞書が追加された際は
-  // 別の cdv 値 (7 等) を割り当て、本定数を分岐させる。
-  const STATIC_DICT_FOR_V6 = 5;
-
-  // ============================================================
-  // V7 SDHT (sdht.js)
-  //   コンテンツ依存トークン置換: 圧縮直前に HTML 本体から頻出 n-gram を抽出し、
-  //   ESC + index の 2 バイトトークンに置換した後で圧縮する。V6 が LZ 圧縮の
-  //   辞書プレフィックスとして外部辞書を提供するのに対し、V7 は本体を物理的に
-  //   短縮してから圧縮器に渡す。両者は補完関係。
-  //   sdht.js のロード失敗時は V7 バリアントを生成せず、V1〜V6 で動作を継続する。
-  // ============================================================
-  const _UAT_SDHT = window.UAT_SDHT;
-  if (!_UAT_SDHT || typeof _UAT_SDHT.encode !== 'function') {
-    console.warn('[url-to-artifact] sdht.js not loaded; V7 in-body tokenization disabled');
-  }
-  const SDHT_AVAILABLE = !!(_UAT_SDHT
-    && typeof _UAT_SDHT.encode === 'function'
-    && typeof _UAT_SDHT.decode === 'function');
-
-  /** 辞書をデータ先頭に付加 */
-  const dictPrefixApply = (text, version) => {
-    const dict = CUSTOM_DICTS[version];
-    return dict ? dict + text : text;
-  };
-  /** 辞書プレフィックスを除去（辞書の固定長分を先頭からスキップ） */
-  const dictPrefixStrip = (text, version) => {
-    const dict = CUSTOM_DICTS[version];
-    return dict ? text.slice(dict.length) : text;
-  };
-
-  /** UTF-8 エンコード → CompressionStream(format) → base64url。format は brotli/gzip/deflate-raw/zstd */
-  const compressWithStream = async (text, format) => {
-    const enc = new TextEncoder();
-    const stream = new Blob([enc.encode(text)]).stream().pipeThrough(new CompressionStream(format));
-    const buf = await new Response(stream).arrayBuffer();
-    return bytesToBase64Url(new Uint8Array(buf));
-  };
-  /** base64url → DecompressionStream(format) → UTF-8 文字列 */
-  const decompressWithStream = async (b64url, format) => {
-    const bytes = base64UrlToBytes(b64url);
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
-    const buf = await new Response(stream).arrayBuffer();
-    return new TextDecoder().decode(buf);
-  };
-
-  /** LZMA-JS をラップした圧縮（callback → Promise）。mode 9 = 最大圧縮。 */
-  const compressLzma = async (text) => {
-    await loadScript(URLS.lzma);
-    if (!window.LZMA) throw new Error('LZMA library failed to load');
-    // LZMA mode 9 は大きな入力で数十秒かかることがある。Web Worker がストールまたは
-    // クラッシュすると callback が永久に呼ばれず Promise がハングし、UI が busy のまま
-    // 固まる事故を防ぐため、30 秒でタイムアウトさせる。
-    const out = await withTimeout(new Promise((resolve, reject) => {
-      window.LZMA.compress(text, 9, (result, err) => {
-        if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
-        // ワーカー異常や中断ケースで result が null/undefined になると、以前のコードでは
-        // result.length で TypeError が出て原因不明のエラーになっていたため、明示メッセージで reject。
-        if (!result || typeof result.length !== 'number') {
-          reject(new Error('LZMA compress returned no data'));
-          return;
-        }
-        // result は Int8Array または number[]。Uint8Array に正規化。
-        const bytes = new Uint8Array(result.length);
-        for (let i = 0; i < result.length; i++) bytes[i] = result[i] & 0xFF;
-        resolve(bytes);
-      });
-    }), 30000, 'LZMA compress');
-    return bytesToBase64Url(out);
-  };
-  /** LZMA-JS の展開。decompress 結果は string（UTF-8 デコード済み）。 */
-  const decompressLzma = async (b64url) => {
-    await loadScript(URLS.lzma);
-    if (!window.LZMA) throw new Error('LZMA library failed to load');
-    const bytes = base64UrlToBytes(b64url);
-    const arr = Array.from(bytes); // LZMA.decompress は Array<number> または Int8Array を受け取る
-    // 展開は通常高速だが、Worker ストール対策として 15 秒でタイムアウト。
-    return await withTimeout(new Promise((resolve, reject) => {
-      window.LZMA.decompress(arr, (result, err) => {
-        if (err) { reject(err instanceof Error ? err : new Error(String(err))); return; }
-        // result が null/undefined のとき String(result) は "null"/"undefined" という文字列になるため
-        // 明示エラーとして reject し、それを HTML として描画してしまう事故を防ぐ。
-        if (result === null || result === undefined) {
-          reject(new Error('LZMA decompress returned no data'));
-          return;
-        }
-        resolve(typeof result === 'string' ? result : String(result));
-      });
-    }), 15000, 'LZMA decompress');
-  };
-
-  /** format 別の展開ディスパッチャ。戻り値: UTF-8 文字列。 */
-  const decompressByFormat = async (b64url, format) => {
-    if (format === 'lzma') return decompressLzma(b64url);
-    return decompressWithStream(b64url, format);
-  };
-
-  /**
-   * Copy Short URL の本体。HTML を A-1 ミニファイし、以下の組み合わせを並列に試行して最短ペイロードを採用:
-   *   - 前処理: ±A-3 静的辞書 × ±カスタム辞書プレフィックス (v1〜)
-   *   - 圧縮: zstd / brotli / brotli-wasm(q11) / deflate-raw / gzip / LZMA
-   * プレフィックス形式: [<digit>]<letter>  digit=辞書バージョン, letter=圧縮形式(大文字=A-3)
-   * 戻り値: { format, prefix, dict, customDictVersion, payload, preprocessedSize }
-   */
-  const compressHtml = async (html) => {
-    const minified = minifyHtml(html);
-    // 前処理バリアント: ±A-3 辞書 × ±カスタム辞書プレフィックス
-    const a3ok = dictCanApply(minified);
-    const a3text = a3ok ? dictApply(minified) : null;
-    const variants = [
-      { text: minified, a3: false, cdv: 0 }
-    ];
-    if (a3ok) variants.push({ text: a3text, a3: true, cdv: 0 });
-    // dicts.js のロード失敗時 (CURRENT_DICT_VERSION === 0) や、CUSTOM_DICTS[N] が null
-    // (バージョン配列に欠番がある異常時) には、dictPrefixApply は text をそのまま返すため
-    // 上の no-dict 変種と完全に同じ入力になる。重複した変種を 6 圧縮器に投げると 12 トライが
-    // 純粋に無駄になり、Copy Short URL の所要時間が約 2 倍になる。利用可能な辞書がある
-    // ときのみ追加する。
-    if (CUSTOM_DICTS[CURRENT_DICT_VERSION]) {
-      variants.push({ text: dictPrefixApply(minified, CURRENT_DICT_VERSION), a3: false, cdv: CURRENT_DICT_VERSION });
-      if (a3ok) variants.push({ text: dictPrefixApply(a3text, CURRENT_DICT_VERSION), a3: true, cdv: CURRENT_DICT_VERSION });
-    }
-    // V6 動的辞書バリアント: dynamic-dict.js が利用可能 + V5 静的辞書がロード済 + 本体が
-    // chooseBudget の閾値を超える場合のみ生成する。動的辞書は本体の n-gram から構築するため、
-    // A-3 適用前後で別途構築する (control-byte 置換後の方が短く整列することがある)。
-    if (DYNAMIC_DICT_AVAILABLE && CUSTOM_DICTS[STATIC_DICT_FOR_V6]) {
-      const v6Static = CUSTOM_DICTS[STATIC_DICT_FOR_V6];
-      const v6Budget = _UAT_DYN.chooseBudget(minified.length);
-      if (v6Budget > 0) {
-        try {
-          const dynNoA3 = _UAT_DYN.buildDictionary(minified, v6Budget);
-          if (dynNoA3) {
-            variants.push({ text: v6Static + dynNoA3 + minified, a3: false, cdv: 6, dynDictLen: dynNoA3.length });
-          }
-          if (a3ok) {
-            const dynA3 = _UAT_DYN.buildDictionary(a3text, v6Budget);
-            if (dynA3) {
-              variants.push({ text: v6Static + dynA3 + a3text, a3: true, cdv: 6, dynDictLen: dynA3.length });
-            }
-          }
-        } catch (e) {
-          // 動的辞書構築失敗時は V6 をスキップして V5 までを採用 (LOG だけ残す)。
-          console.warn('[url-to-artifact] V6 dynamic dictionary build failed:', e && e.message ? e.message : e);
-        }
-      }
-    }
-    // V7 SDHT バリアント: 本体内トークン置換。chooseBudget で本体長閾値を判定し、
-    // 利得が見込める場合のみ追加する。SDHT.encode は失敗時 null を返すので
-    // try/catch は予期しない例外 (バグ) の保険として置いておく。A-3 適用前後で
-    // 別途 encode する: A-3 後の本体は制御文字 0x01-0x1C が散らばっており、SDHT が
-    // 抽出する n-gram もそれを含むため、A-3 ありなしで最適な辞書が異なる。
-    if (SDHT_AVAILABLE) {
-      try {
-        const sdhtNoA3 = _UAT_SDHT.encode(minified);
-        if (sdhtNoA3) {
-          variants.push({ text: sdhtNoA3, a3: false, cdv: 7 });
-        }
-        if (a3ok) {
-          const sdhtA3 = _UAT_SDHT.encode(a3text);
-          if (sdhtA3) {
-            variants.push({ text: sdhtA3, a3: true, cdv: 7 });
-          }
-        }
-      } catch (e) {
-        console.warn('[url-to-artifact] V7 SDHT encode failed:', e && e.message ? e.message : e);
-      }
-    }
-    // 圧縮器リスト: CompressionStream 系 + LZMA + brotli-wasm(q11)
-    const compressors = [
-      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]).map(f => ({
-        pfx: f.prefix, fmt: f.format, fn: (t) => compressWithStream(t, f.format)
-      })),
-      { pfx: 'l', fmt: 'lzma', fn: (t) => compressLzma(t) },
-      { pfx: 'b', fmt: 'brotli', fn: (t) => compressBrotliWasm(t) }
-    ];
-    if (compressors.length === 0) throw new Error('no compression formats are available');
-    // 全組み合わせを並列試行
-    const trials = [];
-    for (const v of variants) {
-      for (const c of compressors) {
-        trials.push({ text: v.text, a3: v.a3, cdv: v.cdv, pfx: c.pfx, fmt: c.fmt, fn: c.fn });
-      }
-    }
-    const results = (await Promise.all(trials.map(async (t) => {
-      try {
-        let payload = await t.fn(t.text);
-        // V6: 圧縮ペイロード先頭に「動的辞書長 (varint)」を埋め込む。base64 を 1 度デコード
-        // → varint と結合 → 再 base64 と 2 ラウンドかかるが、V6 トライアルのみなので影響小。
-        if (t.cdv === 6 && DYNAMIC_DICT_AVAILABLE) {
-          const compressedBytes = base64UrlToBytes(payload);
-          const varintBytes = _UAT_DYN.varintEncode(t.dynDictLen);
-          const combined = new Uint8Array(varintBytes.length + compressedBytes.length);
-          combined.set(varintBytes, 0);
-          combined.set(compressedBytes, varintBytes.length);
-          payload = bytesToBase64Url(combined);
-        }
-        const letter = t.a3 ? t.pfx.toUpperCase() : t.pfx;
-        const prefix = (t.cdv > 0 ? String(t.cdv) : '') + letter;
-        return { format: t.fmt, prefix, dict: t.a3, customDictVersion: t.cdv, payload, preprocessedSize: t.text.length };
-      } catch (e) { return null; }
-    }))).filter(Boolean);
-    if (results.length === 0) throw new Error('compression failed for all available formats');
-    // URL 全体長 (#prefix=payload) で比較する。payload のみの比較だと、cdv プレフィックス
-    // (例: '7' = 1 文字、'5' = 1 文字) のオーバーヘッドが無視され、同 payload 長でも V0 の方が
-    // 短い URL になるケースで V5/V6/V7 を採用してしまい URL が無駄に 1、2 文字長くなる事故を防ぐ。
-    return results.reduce((best, cur) =>
-      (cur.prefix.length + cur.payload.length) < (best.prefix.length + best.payload.length) ? cur : best
-    );
-  };
-
-  /**
-   * format + base64url + dictApplied + customDictVersion から UTF-8 HTML を復元する。
-   * brotli で DecompressionStream 非対応の場合は brotli-wasm にフォールバック。
-   * customDictVersion > 0 → 辞書プレフィックス除去、dictApplied=true → A-3 逆処理。
-   */
-  const decompressHtml = async (format, b64url, dictApplied, customDictVersion) => {
-    // V6 (動的辞書 + V5 静的辞書): ペイロード先頭の varint で動的辞書長を読み、
-    // 圧縮データを切り出し、展開後に「V5 辞書長 + 動的辞書長」分を slice で除去する。
-    // この分岐は customDictVersion > 0 の汎用パスより前に置く必要がある (CUSTOM_DICTS[6]
-    // は存在しないため汎用パスに落ちるとエラーになる)。
-    if (customDictVersion === 6) {
-      if (!DYNAMIC_DICT_AVAILABLE) {
-        throw new Error('V6 URL but dynamic-dict.js failed to load');
-      }
-      const v6Static = CUSTOM_DICTS[STATIC_DICT_FOR_V6];
-      if (!v6Static) {
-        throw new Error('V6 requires V' + STATIC_DICT_FOR_V6 + ' static dictionary but none loaded');
-      }
-      const allBytes = base64UrlToBytes(b64url);
-      const decoded = _UAT_DYN.varintDecode(allBytes, 0);
-      const dynDictLen = decoded.value;
-      const compressedBytes = allBytes.slice(decoded.nextOffset);
-      const compressedB64 = bytesToBase64Url(compressedBytes);
-      let raw;
-      if (format === 'brotli' && !decompressSupport['brotli']) {
-        raw = await decompressBrotliWasm(compressedB64);
-      } else {
-        raw = await decompressByFormat(compressedB64, format);
-      }
-      const headerLen = v6Static.length + dynDictLen;
-      if (raw.length < headerLen) {
-        throw new Error('V6 decompressed text too short for headers (got ' + raw.length + ', need ' + headerLen + ')');
-      }
-      const stripped = raw.slice(headerLen);
-      return dictApplied ? dictReverse(stripped) : stripped;
-    }
-    // V7 SDHT (本体内トークン置換): 圧縮ペイロード = compress(SDHT.encode(body)) なので、
-    // 展開後にそのまま SDHT.decode を通せば元の (ミニファイ済み) 本体に戻る。
-    // varint 解析は SDHT.decode 内で行うため、index.html 側で base64 を 2 度 round-trip する必要がない。
-    if (customDictVersion === 7) {
-      if (!SDHT_AVAILABLE) {
-        throw new Error('V7 URL but sdht.js failed to load');
-      }
-      let raw;
-      if (format === 'brotli' && !decompressSupport['brotli']) {
-        raw = await decompressBrotliWasm(b64url);
-      } else {
-        raw = await decompressByFormat(b64url, format);
-      }
-      const decoded = _UAT_SDHT.decode(raw);
-      return dictApplied ? dictReverse(decoded) : decoded;
-    }
-    let text;
-    if (format === 'brotli' && !decompressSupport['brotli']) {
-      text = await decompressBrotliWasm(b64url);
-    } else {
-      text = await decompressByFormat(b64url, format);
-    }
-    if (customDictVersion > 0) {
-      if (!CUSTOM_DICTS[customDictVersion]) throw new Error('unsupported custom dictionary version: ' + customDictVersion);
-      text = dictPrefixStrip(text, customDictVersion);
-    }
-    return dictApplied ? dictReverse(text) : text;
-  };
-
-  // ============================================================
-  // Lazy library loader
-  // ============================================================
-  // タイムアウトを設定して、CDN がハングした場合に await loadScript() が永遠に
-  // 解決されず、エクスポートボタンが busy のまま固まる事故を防ぐ。
-  // 30 秒でも load も error も発火しない場合は明示エラーで reject、
-  // _loaded の cache を delete してリトライ可能な状態に戻す。
-  const _loaded = {};
-  const SCRIPT_LOAD_TIMEOUT_MS = 30000;
-  const loadScript = (url) => _loaded[url] || (_loaded[url] = new Promise((res, rej) => {
-    const s = document.createElement('script');
-    let done = false;
-    let timer = 0;
-    const finish = (ok, err) => {
-      if (done) return;
-      done = true;
-      if (timer) clearTimeout(timer);
-      if (ok) res();
-      else { delete _loaded[url]; rej(err); }
-    };
-    s.src = url;
-    s.async = true;
-    s.onload = () => finish(true);
-    s.onerror = () => finish(false, new Error('Failed to load library: ' + url));
-    timer = setTimeout(
-      () => finish(false, new Error('Library load timed out (' + (SCRIPT_LOAD_TIMEOUT_MS / 1000) + 's): ' + url)),
-      SCRIPT_LOAD_TIMEOUT_MS
-    );
-    document.head.appendChild(s);
-  }));
-  const URLS = {
-    html2canvas: 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
-    jspdf:       'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-    pptxgen:     'https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js',
-    jszip:       'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
-    // LZMA-JS 2.3.2 (pure-JS LZMA1 圧縮/展開)。Copy Short URL でブラウザ内蔵 CompressionStream
-    // (zstd / Brotli / deflate-raw / gzip) と並列に試行し最短ペイロードを採用する。worker版は
-    // window.LZMA グローバルに Web Worker を内部生成 (Blob URL)。約85KB minified、外部送信ゼロ。
-    lzma:        'https://cdn.jsdelivr.net/npm/lzma@2.3.2/src/lzma_worker-min.js'
-  };
+  const exportCtx = E && E.init({
+    frame,
+    getCurrentHtml: () => currentHtml,
+    setStatus, setBusy, showProgress,
+    baseFilename, downloadBlob, canvasToBlob
+  });
+  const exporters = (exportCtx && exportCtx.exporters) || {};
 
   // ============================================================
   // Paste-to-shorten flow
@@ -841,9 +170,33 @@
     try { urlObj = new URL(trimmed); } catch (e) { /* not a URL */ }
     if (urlObj) {
       hashPart = urlObj.hash ? urlObj.hash.slice(1) : '';
-      if (!hashPart) throw new Error('URL に # 以降のコンテンツがありません');
+      if (!hashPart) {
+        // 一部のクリップボード / フォーラム / メーラー等が URL 中の `#` を `%23` にエスケープしてしまう。
+        // URL parse 後の hash が空でも、入力文字列中に `%23` があれば最初の `%23` 以降を
+        // hash として再解釈する。スキーム付き URL として parse できている時点で、
+        // path/query 中の `%23` はフラグメント区切りのエスケープと見なすのが自然。
+        // ただし、`?token=abc%23def` のように単に query 文字列に %23 が含まれているだけ
+        // のケースで誤って recover すると、意味のない文字列を HTML 扱いして圧縮してしまうため、
+        // recover 候補を「短縮 URL らしい」または「HTML らしい (`<` または `%3C` 始まり)」場合に限定する。
+        // render() 側の %23 リカバリと同じフィルタ条件で揃えることで、アドレスバー直接訪問と
+        // ペースト UI のどちらからも同じルールでコンテンツを拾える。
+        const idx = trimmed.search(/%23/i);
+        if (idx >= 0) {
+          const recovered = trimmed.slice(idx + 3);
+          if (SHORT_URL_HASH_RE.test(recovered) || /^(<|%3[Cc])/.test(recovered)) {
+            hashPart = recovered;
+          } else {
+            throw new Error('URL に # (または %23) 以降の有効なコンテンツがありません');
+          }
+        } else {
+          throw new Error('URL に # (または %23) 以降のコンテンツがありません');
+        }
+      }
     } else if (trimmed.charAt(0) === '#') {
       hashPart = trimmed.slice(1);
+    } else if (/^%23/i.test(trimmed)) {
+      // URL として parse できないが先頭が `%23` のケース。hash 文字列だけ貼られてエスケープされたものと見なす。
+      hashPart = trimmed.slice(3);
     }
 
     let html;
@@ -1083,6 +436,33 @@
   let renderSeq = 0;
   /** location.hash からHTMLを取り出してフレームに反映（`#z=...` は gzip 圧縮されたペイロード） */
   const render = async () => {
+    // %23 リカバリ: メーラー / チャット / フォーラム等が URL 中の `#` を `%23` に
+    // エスケープしてしまったケースを救済する。`location.hash` は空でも、URL 文字列中に
+    // `%23` があり、その後ろが「短縮URL形式」または「HTML らしき文字列」であれば、本来の
+    // フラグメント区切りとみなして history.replaceState で `#` 付きの URL に直してから
+    // 描画フローに入る。クエリパラメータ値に偶然 %23 が紛れたケース (例: ?token=abc%23def)
+    // で誤動作しないよう、復元先の中身を「短縮URL or HTMLらしさ」でパターン判定する。
+    // この処理はペースト経由 (uatProcessPaste) の %23 救済とは別経路: アドレスバー直接訪問時に
+    // ペースト UI を経由せず即描画させるためのもの。
+    if (!location.hash) {
+      const hrefStr = location.href;
+      const pctIdx = hrefStr.search(/%23/i);
+      if (pctIdx >= 0) {
+        const recovered = hrefStr.slice(pctIdx + 3);
+        const looksLikeShortUrl = SHORT_URL_HASH_RE.test(recovered);
+        // `<` 直開始 (生HTML) または `%3C` (URLエンコード済み HTML) を判定。`%3c` 小文字も許容。
+        const looksLikeHtml = /^(<|%3[Cc])/.test(recovered);
+        if (looksLikeShortUrl || looksLikeHtml) {
+          try {
+            history.replaceState(null, '', hrefStr.slice(0, pctIdx) + '#' + recovered);
+          } catch (e) {
+            // recovered に replaceState が拒否する制御文字等が含まれていた場合のフォールバック。
+            // 失敗時は何もせず通常の empty state 表示に進む (致命ではない)。
+            console.warn('[url-to-artifact] %23 -> # recovery failed:', e);
+          }
+        }
+      }
+    }
     const mySeq = ++renderSeq;
     const raw = location.hash.slice(1);
     if (!raw) {
@@ -1174,860 +554,32 @@
   };
 
   // ============================================================
-  // Capture (iframe -> Canvas[])
-  // ============================================================
-  /** iframe ロード完了待ち（最大1.5秒のフォールバック） */
-  const waitForFrame = () => new Promise((res) => {
-    const ready = frame.contentDocument && frame.contentDocument.readyState === 'complete';
-    if (ready) { res(); return; }
-    let done = false;
-    frame.addEventListener('load', () => { if (!done) { done = true; res(); } }, { once: true });
-    setTimeout(() => { if (!done) { done = true; res(); } }, 1500);
-  });
-
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const next2Frames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-  /** documentElement を html2canvas で撮影 */
-  const snapshot = (doc, ww, hh) => window.html2canvas(doc.documentElement, {
-    backgroundColor: '#ffffff',
-    scale: 2,
-    useCORS: true,
-    logging: false,
-    windowWidth: ww || doc.documentElement.scrollWidth,
-    windowHeight: hh || doc.documentElement.scrollHeight
-  });
-
-  /**
-   * スライド構造を自動検出して順番に撮影。
-   *   reveal.js    : Reveal.slide(h,v,f) で全スライドを巡回（transition: none）
-   *   汎用<section>: body / main / .slides / .marpit 直下の <section>・.slide を display 切替で巡回
-   *   <hr> 区切り  : body 直下の <hr> でグルーピングして display 切替で巡回（Markdown の --- 由来など）
-   *   フォールバック : 全体1枚
-   * 戻り値: { canvases: HTMLCanvasElement[], mode: 'reveal'|'sections'|'hr'|'single' }
-   */
-  const captureSlides = async () => {
-    await loadScript(URLS.html2canvas);
-    await waitForFrame();
-    const doc = frame.contentDocument;
-    const win = frame.contentWindow;
-    if (!doc || !doc.documentElement) {
-      throw new Error('iframe document is unavailable (sandbox may be too strict)');
-    }
-
-    // ---- reveal.js path ----
-    const Reveal = win && win.Reveal;
-    const hasReveal = Reveal
-      && typeof Reveal.slide === 'function'
-      && typeof Reveal.getSlides === 'function'
-      && typeof Reveal.getIndices === 'function';
-    if (hasReveal) {
-      let slides = [];
-      try { slides = Reveal.getSlides() || []; } catch (e) { slides = []; }
-      if (slides.length > 1) {
-        let origIdx = null;
-        let origCfg = null;
-        try { origIdx = Reveal.getIndices(); } catch (e) {}
-        // 元の configure 値を保存して、export後に復元する（transitionを永遠にnoneにしたままにしない）
-        try {
-          if (typeof Reveal.getConfig === 'function') {
-            const cfg = Reveal.getConfig() || {};
-            origCfg = {
-              transition: cfg.transition,
-              backgroundTransition: cfg.backgroundTransition,
-              controls: cfg.controls,
-              progress: cfg.progress
-            };
-          }
-        } catch (e) {}
-        try { Reveal.configure({ transition: 'none', backgroundTransition: 'none', controls: false, progress: false }); } catch (e) {}
-        const ww = frame.clientWidth || doc.documentElement.scrollWidth;
-        const hh = frame.clientHeight || doc.documentElement.scrollHeight;
-        const canvases = [];
-        try {
-          for (let i = 0; i < slides.length; i++) {
-            let idx = { h: i, v: 0 };
-            try { idx = Reveal.getIndices(slides[i]) || idx; } catch (e) {}
-            try { Reveal.slide(idx.h || 0, idx.v || 0, idx.f); } catch (e) {}
-            await sleep(150);
-            await next2Frames();
-            showProgress(i + 1, slides.length);
-            setStatus('exporting slide ' + (i + 1) + '/' + slides.length + '...');
-            canvases.push(await snapshot(doc, ww, hh));
-          }
-        } finally {
-          if (origCfg) {
-            try { Reveal.configure(origCfg); } catch (e) {}
-          }
-          if (origIdx) {
-            try { Reveal.slide(origIdx.h || 0, origIdx.v || 0, origIdx.f); } catch (e) {}
-          }
-        }
-        return { canvases, mode: 'reveal' };
-      }
-    }
-
-    // ---- 汎用セクション分割 ----
-    const selectors = [
-      'body > section',
-      '.marpit > section',
-      'body > .slide',
-      'body > div.slide',
-      'main > section',
-      'main > .slide',
-      '.slides > section'
-    ];
-    let sections = null;
-    for (const sel of selectors) {
-      const found = Array.from(doc.querySelectorAll(sel));
-      if (found.length > 1) { sections = found; break; }
-    }
-    if (sections) {
-      const original = sections.map(s => s.style.display);
-      const ww = doc.documentElement.scrollWidth;
-      const canvases = [];
-      try {
-        for (let i = 0; i < sections.length; i++) {
-          sections.forEach((s, j) => { s.style.display = (i === j) ? '' : 'none'; });
-          await next2Frames();
-          showProgress(i + 1, sections.length);
-          setStatus('exporting slide ' + (i + 1) + '/' + sections.length + '...');
-          const visibleH = sections[i].scrollHeight || doc.documentElement.scrollHeight;
-          canvases.push(await snapshot(doc, ww, visibleH));
-        }
-      } finally {
-        sections.forEach((s, j) => { s.style.display = original[j]; });
-      }
-      return { canvases, mode: 'sections' };
-    }
-
-    // ---- <hr> 区切りスライド (Markdown→HTML 直変換などで body 直下に <hr> が並ぶケース) ----
-    const allHrs = Array.from(doc.querySelectorAll('body > hr'));
-    if (allHrs.length >= 2) {
-      const SKIP_TAGS = ['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','LINK','META','TITLE','BASE'];
-      const allEls = Array.from(doc.body.children).filter(el => SKIP_TAGS.indexOf(el.tagName) < 0);
-      const groups = [];
-      let current = [];
-      for (const el of allEls) {
-        if (el.tagName === 'HR') {
-          if (current.length > 0) { groups.push(current); current = []; }
-        } else {
-          current.push(el);
-        }
-      }
-      if (current.length > 0) groups.push(current);
-
-      if (groups.length > 1) {
-        const original = allEls.map(el => el.style.display);
-        const ww = doc.documentElement.scrollWidth;
-        const canvases = [];
-        try {
-          for (let i = 0; i < groups.length; i++) {
-            const visible = new Set(groups[i]);
-            allEls.forEach(el => { el.style.display = visible.has(el) ? '' : 'none'; });
-            await next2Frames();
-            showProgress(i + 1, groups.length);
-            setStatus('exporting slide ' + (i + 1) + '/' + groups.length + '...');
-            const visibleH = doc.body.scrollHeight || doc.documentElement.scrollHeight;
-            canvases.push(await snapshot(doc, ww, visibleH));
-          }
-        } finally {
-          allEls.forEach((el, j) => { el.style.display = original[j]; });
-        }
-        return { canvases, mode: 'hr' };
-      }
-    }
-
-    // ---- フォールバック：全体1枚 ----
-    return { canvases: [await snapshot(doc)], mode: 'single' };
-  };
-
-  // ============================================================
-  // Editable PPTX (Marpit) — extracts native PPTX text/image/table from DOM
-  // ============================================================
-
-  /**
-   * 任意の CSS 色文字列を 'RRGGBB' に変換する。透明 (alpha < 0.05) は null。
-   * rgb / rgba は直接パースし、それ以外（oklch / lch / hsl / hwb / color() / hex /
-   * 名前付きカラーなど）は canvas の fillStyle 正規化を介して rgb 文字列に揃えてから
-   * 再パースする。これにより Tailwind CSS 4 などが既定で出力する oklch カラーも PPTX に
-   * 反映される。以前は rgb() 以外をすべて null 扱いにしていたため、モダンアーティファクトで
-   * PPTX の色が一斉に化ける事故が起きる。
-   */
-  const _colorNormCanvas = (() => {
-    try { return document.createElement('canvas').getContext('2d'); }
-    catch (e) { return null; }
-  })();
-  const RGB_RE = /^rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*([\d.]+))?\)$/;
-  const cssColorToHex = (color) => {
-    if (!color) return null;
-    const s = String(color);
-    let m = s.match(RGB_RE);
-    if (!m && _colorNormCanvas) {
-      try {
-        // 二段ベースライン方式で「不正な色」を判定する。
-        //   問題: 1 つのベースライン (#01020a) との比較だけだと、ユーザ色がたまたま
-        //         そのベースラインの正規化形 (例: '#01020a' そのもの、'rgb(1, 2, 10)') と
-        //         一致した場合に「不正」と誤判定し、有効な色を null として捨ててしまう。
-        //         これで PPTX 色が一部のスライドで反映されなくなる事故が起きうる。
-        //   対策: 異なる 2 色のベースラインで順に試行する。s が片方のベースラインと
-        //         衝突しても、もう片方では fillStyle が更新されるため確実に判定できる。
-        //   なお fillStyle の読み返し形式はブラウザ依存で、CSS Color Level 4 以降では
-        //   '#01020a' を代入しても 'rgb(1, 2, 10)' という文字列で返される可能性があるため、
-        //   ハードコード文字列ではなく「代入直後に読み戻した値」をセンチネルとして使う。
-        let norm = null;
-        _colorNormCanvas.fillStyle = '#01020a';
-        const sent1 = String(_colorNormCanvas.fillStyle);
-        _colorNormCanvas.fillStyle = s;
-        const norm1 = String(_colorNormCanvas.fillStyle);
-        if (norm1 !== sent1) {
-          norm = norm1;
-        } else {
-          // norm1 === sent1: s は不正 OR s の正規化形が偶然 sent1 と一致。
-          // 別ベースラインで再試行し、更新されれば s は有効と確定する。
-          _colorNormCanvas.fillStyle = '#fdfefe';
-          const sent2 = String(_colorNormCanvas.fillStyle);
-          _colorNormCanvas.fillStyle = s;
-          const norm2 = String(_colorNormCanvas.fillStyle);
-          if (norm2 !== sent2) norm = norm2;
-        }
-        if (norm) {
-          m = norm.match(RGB_RE);
-          if (!m) {
-            const hexm = norm.match(/^#([0-9a-fA-F]{6})$/);
-            if (hexm) return hexm[1].toUpperCase();
-          }
-        }
-      } catch (e) { /* canvas 非対応・色解析失敗時は null フォールバック */ }
-    }
-    if (!m) return null;
-    const a = m[4] === undefined ? 1 : parseFloat(m[4]);
-    if (a < 0.05) return null;
-    const toHex = (v) => Math.round(parseFloat(v)).toString(16).padStart(2, '0');
-    return (toHex(m[1]) + toHex(m[2]) + toHex(m[3])).toUpperCase();
-  };
-
-  /** font-family の最初のフォント名だけ取り出す（クォートを剥がす） */
-  const fontFamilyFirst = (ff) => {
-    if (!ff) return undefined;
-    const first = String(ff).split(',')[0].replace(/['"]/g, '').trim();
-    return first || undefined;
-  };
-
-  /**
-   * DOM要素配下のテキストを書式付きランの配列として抽出（pptxgenjs addText形式）。
-   * @param fontScale 与えると要素ごとに fontSize (pt) も run options に反映する
-   */
-  const extractRunsFromElement = (root, win, fontScale) => {
-    const runs = [];
-    const isInlineDsp = (d) => d === 'inline' || d === 'inline-block' || d === 'inline-flex' || d === 'inline-grid' || d === 'contents' || d === 'inline-table' || d === 'ruby';
-    const clampFontPt = (v) => Math.max(6, Math.min(96, v));
-    const walk = (node, ctx) => {
-      if (node.nodeType === 3) {
-        // HTML の空白圧縮ルールに合わせ、改行・連続空白を 1 個のスペースに畳む。
-        // これをしないと `<h1>foo</h1>\n<p>bar</p>` の `\n` がランとして PPTX に出力され、
-        // 見出し前後に意図しない大きな余白が出る。また、空白のみのランは、直前のランが
-        // 既に空白で終わっている・改行 (breakLine) になっているときは捨てる。
-        let t = node.textContent;
-        if (!t) return;
-        t = t.replace(/\s+/g, ' ');
-        if (t === ' ') {
-          const prev = runs[runs.length - 1];
-          if (!prev || (prev.text && /\s$/.test(prev.text)) || prev.options.breakLine) return;
-        }
-        runs.push({ text: t, options: Object.assign({}, ctx) });
-        return;
-      }
-      if (node.nodeType !== 1) return;
-      const tag = node.tagName;
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
-      if (tag === 'BR') {
-        runs.push({ text: '', options: Object.assign({}, ctx, { breakLine: true }) });
-        return;
-      }
-      const cs = win.getComputedStyle(node);
-      // opacity=0 で隠している要素 (Tailwind の `opacity-0` クラス、トースト、ツールチップ等)
-      // も PPTX には出さないようスキップする。これをしないとドロップダウンやホバー表示の
-      // テキストがスライド本体に紛れ込む。
-      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return;
-      // ブロックレベル要素の前にbreakLineを挿入（連続テキストを行で区切る、ルートはruns=0で自然にスキップ）
-      if (!isInlineDsp(cs.display) && runs.length > 0 && !runs[runs.length - 1].options.breakLine) {
-        runs[runs.length - 1].options = Object.assign({}, runs[runs.length - 1].options, { breakLine: true });
-      }
-      const newCtx = Object.assign({}, ctx);
-      const fw = parseInt(cs.fontWeight, 10);
-      if ((!isNaN(fw) && fw >= 600) || tag === 'STRONG' || tag === 'B') newCtx.bold = true;
-      if (cs.fontStyle === 'italic' || tag === 'EM' || tag === 'I') newCtx.italic = true;
-      const tdline = (cs.textDecorationLine || cs.textDecoration || '');
-      if (tdline.indexOf('underline') >= 0 || tag === 'U') newCtx.underline = { style: 'sng' };
-      if (tdline.indexOf('line-through') >= 0 || tag === 'S' || tag === 'STRIKE' || tag === 'DEL') newCtx.strike = 'sngStrike';
-      const c = cssColorToHex(cs.color);
-      if (c) newCtx.color = c;
-      if (tag === 'CODE' || tag === 'KBD' || tag === 'SAMP' || tag === 'TT') newCtx.fontFace = 'Consolas';
-      if (tag === 'A') {
-        // SVGの<a>は node.href が SVGAnimatedString になるため getAttribute を使う
-        const href = node.getAttribute && node.getAttribute('href');
-        if (href) {
-          const url = (typeof node.href === 'string' && node.href) || href;
-          // PowerPointで開いた際の安全性のため javascript: / data: / vbscript: スキームは除外
-          if (!/^\s*(javascript|data|vbscript):/i.test(url)) {
-            newCtx.hyperlink = { url };
-          }
-        }
-      }
-      // fontScale が渡された場合は、要素ごとの font-size も run options に反映する
-      if (fontScale) {
-        const fpx = parseFloat(cs.fontSize);
-        if (!isNaN(fpx) && fpx > 0) newCtx.fontSize = clampFontPt(fpx * fontScale * 72);
-      }
-      Array.from(node.childNodes).forEach((ch) => walk(ch, newCtx));
-    };
-    walk(root, {});
-    // 末尾の「不要な breakLine」を除去する。ブロック要素出口で付与された自動改行
-    // （次のブロックとの間を区切るための何か）が、実際には次がないケース (例: <p>foo</p><p></p>
-    // や <h1>title</h1> だけのテキストフレーム) ではテキスト末尾に意味のない空行が出る。
-    // ただし <br> 由来の breakLineマーカー (text === '' && breakLine === true) はユーザ明示の改行意図なので
-    // 保持し、text が空でない run に付いた末尾の自動 breakLine のみを除ける。
-    if (runs.length > 0) {
-      const last = runs[runs.length - 1];
-      if (last.options.breakLine && last.text !== '') {
-        const newOpts = Object.assign({}, last.options);
-        delete newOpts.breakLine;
-        last.options = newOpts;
-      }
-    }
-    return runs;
-  };
-
-  /** <img>を可能ならdataURL化（同一オリジン or 既にdataURLの場合のみ成功） */
-  const imgToDataURL = (img, doc) => {
-    if (!img.src) return null;
-    if (img.src.startsWith('data:')) return img.src;
-    try {
-      const c = doc.createElement('canvas');
-      c.width = img.naturalWidth || img.width || 1;
-      c.height = img.naturalHeight || img.height || 1;
-      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-      return c.toDataURL('image/png');
-    } catch (e) {
-      return null;
-    }
-  };
-
-  /**
-   * Marpit形式の<section>群から、編集可能なネイティブPPTXを構築する。
-   * 各<section>を1スライドに割り当て、配下の見出し・段落・リスト・表・画像・hrを
-   * getBoundingClientRectで実測した位置・サイズでネイティブPPTX要素として配置する。
-   * 文字色・背景色・フォントサイズ・太字・斜体・下線・取り消し線・リンクを反映。
-   */
-  const buildEditablePptx = async (pptx, sections, doc, win) => {
-    const slideW = 13.333, slideH = 7.5;
-    const HANDLED = ['H1','H2','H3','H4','H5','H6','P','UL','OL','BLOCKQUOTE','PRE','TABLE','IMG','HR','FIGCAPTION'];
-    const clampPt = (v) => Math.max(6, Math.min(96, v));
-
-    // 画像のロード完了を最大 3 秒待つ（dataURL化に naturalWidth>0 が必要）
-    const allImgs = [];
-    sections.forEach(s => Array.from(s.querySelectorAll('img')).forEach(img => allImgs.push(img)));
-    if (allImgs.length > 0) {
-      await Promise.all(allImgs.map(img => {
-        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-        return new Promise(res => {
-          let done = false;
-          const finish = () => { if (!done) { done = true; res(); } };
-          img.addEventListener('load', finish, { once: true });
-          img.addEventListener('error', finish, { once: true });
-          setTimeout(finish, 3000);
-        });
-      }));
-    }
-
-    // Marpitなどがビューポートにフィットさせるために transform: scale() を使うと、
-    // getBoundingClientRect は縮小後の値を返す一方で font-size の px 値は変わらず、
-    // 計算した fontPt が過大になる。計測中は一時的に transform を解除する。
-    const transformedEls = [];
-    const savedTransforms = [];
-    sections.forEach(s => {
-      let el = s;
-      while (el && el !== doc.documentElement) {
-        if (win.getComputedStyle(el).transform !== 'none' && transformedEls.indexOf(el) < 0) {
-          transformedEls.push(el);
-          savedTransforms.push(el.style.transform);
-        }
-        el = el.parentElement;
-      }
-    });
-    transformedEls.forEach(el => el.style.setProperty('transform', 'none', 'important'));
-
-    const HANDLED_SELECTOR = HANDLED.map(t => t.toLowerCase()).join(',');
-    const collectLeaves = (root) => {
-      const leaves = [];
-      const pushImgs = (el) => {
-        Array.from(el.querySelectorAll('img')).forEach((img) => {
-          const imgCs = win.getComputedStyle(img);
-          // 上記同様 opacity=0 も隠し扱いとしてスキップ。
-          if (imgCs.display !== 'none' && imgCs.visibility !== 'hidden' && parseFloat(imgCs.opacity) !== 0) leaves.push(img);
-        });
-      };
-      const visit = (el) => {
-        if (!el || el.nodeType !== 1) return;
-        const cs = win.getComputedStyle(el);
-        // opacity=0 要素もスキップして PPTX にゴースト要素が出ないようにする。
-        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return;
-        const tag = el.tagName;
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return;
-        if (HANDLED.indexOf(tag) >= 0) {
-          leaves.push(el);
-          // 段落・見出し等の中に <img> がある場合は、IMG も独立 leaf として追加し、
-          // ネイティブ画像として配置する（p の runs が空なら addText はスキップされる）
-          if (tag !== 'IMG' && tag !== 'TABLE' && tag !== 'PRE') pushImgs(el);
-          return;
-        }
-        // 非HANDLED要素 (div, header, footer など) の処理：
-        // (a) 配下に HANDLED 要素があれば children を再帰探索する
-        if (el.querySelector(HANDLED_SELECTOR)) {
-          Array.from(el.children).forEach(visit);
-          return;
-        }
-        // (b) HANDLED 配下なし。div だけで構成されたUI（カードグリッド・タイムライン等）に対応：
-        //     テキストor画像を持つ要素の子が複数あれば、それぞれを再帰してflex/grid各セルを保つ
-        const textOrImageChildren = Array.from(el.children).filter(c => {
-          if (c.nodeType !== 1) return false;
-          const ccs = win.getComputedStyle(c);
-          if (ccs.display === 'none' || ccs.visibility === 'hidden' || parseFloat(ccs.opacity) === 0) return false;
-          if (c.tagName === 'IMG') return true;
-          const ct = c.textContent && c.textContent.trim();
-          return !!ct || !!c.querySelector('img');
-        });
-        if (textOrImageChildren.length > 1) {
-          textOrImageChildren.forEach(visit);
-          return;
-        }
-        // (c) 子コンテンツが1つ以下 → 自身がテキストを持つなら leaf として配置
-        const selfText = el.textContent && el.textContent.trim();
-        if (selfText) {
-          leaves.push(el);
-          pushImgs(el); // コンテナ内の <img> は独立配置
-          return;
-        }
-        // (d) 画像のみのコンテナ
-        pushImgs(el);
-      };
-      Array.from(root.children).forEach(visit);
-      return leaves;
-    };
-
-    const original = sections.map(s => s.style.display);
-    try {
-      for (let i = 0; i < sections.length; i++) {
-        sections.forEach((s, j) => { s.style.display = (i === j) ? '' : 'none'; });
-        await next2Frames();
-        showProgress(i + 1, sections.length);
-        setStatus('building slide ' + (i + 1) + '/' + sections.length + '...');
-
-        const section = sections[i];
-        const secRect = section.getBoundingClientRect();
-        // 空・極小 section はスライドを作らずにスキップ（空白スライドと、fontScaleが爆発的に大きくなる事態を防止）
-        if (secRect.width < 10 || secRect.height < 10) continue;
-        const slide = pptx.addSlide();
-
-        const secStyle = win.getComputedStyle(section);
-        const secBg = cssColorToHex(secStyle.backgroundColor);
-        if (secBg) slide.background = { color: secBg };
-
-        const scaleX = slideW / secRect.width;
-        const scaleY = slideH / secRect.height;
-        const fontScale = scaleY;
-
-        const leaves = collectLeaves(section);
-        for (const el of leaves) {
-          const r = el.getBoundingClientRect();
-          const x = (r.left - secRect.left) * scaleX;
-          const y = (r.top - secRect.top) * scaleY;
-          const w = r.width * scaleX;
-          const h = r.height * scaleY;
-          if (w <= 0.01 || h <= 0.01) continue;
-
-          const tag = el.tagName;
-          const cs = win.getComputedStyle(el);
-          const fontSizePx = parseFloat(cs.fontSize) || 16;
-          const fontPt = clampPt(fontSizePx * fontScale * 72);
-          const color = cssColorToHex(cs.color);
-          const bgcolor = cssColorToHex(cs.backgroundColor);
-          const fontFace = fontFamilyFirst(cs.fontFamily);
-          const fwn = parseInt(cs.fontWeight, 10);
-          const isBold = (!isNaN(fwn) && fwn >= 600) || tag === 'STRONG' || tag === 'B';
-          const isItalic = cs.fontStyle === 'italic';
-          const ta = cs.textAlign;
-          const align = (ta === 'center') ? 'center'
-            : (ta === 'right' || ta === 'end') ? 'right'
-            : (ta === 'justify') ? 'justify'
-            : 'left';
-
-          if (tag === 'IMG') {
-            const data = imgToDataURL(el, doc);
-            if (data) slide.addImage({ data, x, y, w, h });
-            continue;
-          }
-          if (tag === 'HR') {
-            const lineColor = color || cssColorToHex(cs.borderTopColor) || '888888';
-            slide.addShape('rect', {
-              x, y: y + h/2 - 0.01, w, h: 0.02,
-              fill: { color: lineColor },
-              line: { color: lineColor, width: 0 }
-            });
-            continue;
-          }
-          if (tag === 'TABLE') {
-            const rows = Array.from(el.querySelectorAll('tr')).map((tr) =>
-              Array.from(tr.children).filter(cc => cc.tagName === 'TH' || cc.tagName === 'TD').map((td) => {
-                const tdcs = win.getComputedStyle(td);
-                const tdfill = cssColorToHex(tdcs.backgroundColor);
-                const tdcolor = cssColorToHex(tdcs.color);
-                const tdfsize = parseFloat(tdcs.fontSize) || fontSizePx;
-                const cellRuns = extractRunsFromElement(td, win, fontScale);
-                return {
-                  // 空セルはスペース1つをプレースホルダーとして返す（pptxgenjsの表セルに text: [] を渡すと不安定）
-                  text: cellRuns.length > 0 ? cellRuns : [{ text: ' ', options: {} }],
-                  options: {
-                    fill: tdfill ? { color: tdfill } : undefined,
-                    color: tdcolor || undefined,
-                    bold: td.tagName === 'TH' ? true : undefined,
-                    fontSize: clampPt(tdfsize * fontScale * 72),
-                    fontFace,
-                    colspan: parseInt(td.getAttribute('colspan'), 10) > 1 ? parseInt(td.getAttribute('colspan'), 10) : undefined,
-                    rowspan: parseInt(td.getAttribute('rowspan'), 10) > 1 ? parseInt(td.getAttribute('rowspan'), 10) : undefined
-                  }
-                };
-              })
-            ).filter(r => r.length > 0);
-            if (rows.length > 0) {
-              slide.addTable(rows, { x, y, w, h, fontSize: fontPt, fontFace, color: color || undefined });
-            }
-            continue;
-          }
-          if (tag === 'UL' || tag === 'OL') {
-            const items = Array.from(el.children).filter((cc) => cc.tagName === 'LI');
-            if (items.length === 0) continue;
-            const arr = [];
-            items.forEach((li, idx) => {
-              const liRuns = extractRunsFromElement(li, win, fontScale);
-              if (liRuns.length === 0) liRuns.push({ text: ' ', options: {} });
-              for (let k = 0; k < liRuns.length; k++) {
-                if (k === liRuns.length - 1 && idx < items.length - 1) {
-                  liRuns[k].options = Object.assign({}, liRuns[k].options, { breakLine: true });
-                }
-                arr.push(liRuns[k]);
-              }
-            });
-            slide.addText(arr, {
-              x, y, w, h,
-              fontSize: fontPt,
-              color: color || undefined,
-              bold: isBold || undefined,
-              italic: isItalic || undefined,
-              fontFace,
-              align,
-              valign: 'top',
-              bullet: tag === 'OL' ? { type: 'number' } : true,
-              fill: bgcolor ? { color: bgcolor } : undefined,
-              paraSpaceAfter: 4
-            });
-            continue;
-          }
-          if (tag === 'PRE') {
-            const text = el.textContent || '';
-            slide.addText(text, {
-              x, y, w, h,
-              fontSize: clampPt(fontPt * 0.9),
-              color: color || undefined,
-              fontFace: 'Consolas',
-              align: 'left',
-              valign: 'top',
-              fill: { color: bgcolor || 'F4F4F4' },
-              isTextBox: true
-            });
-            continue;
-          }
-          // h1-h6, p, blockquote, figcaption
-          const runs = extractRunsFromElement(el, win, fontScale);
-          if (runs.length === 0) continue;
-          slide.addText(runs, {
-            x, y, w, h,
-            fontSize: fontPt,
-            color: color || undefined,
-            bold: isBold || undefined,
-            italic: isItalic || undefined,
-            fontFace,
-            align,
-            valign: 'top',
-            fill: bgcolor ? { color: bgcolor } : undefined
-          });
-        }
-      }
-    } finally {
-      sections.forEach((s, j) => { s.style.display = original[j]; });
-      transformedEls.forEach((el, idx) => {
-        const v = savedTransforms[idx];
-        if (v) el.style.transform = v;
-        else el.style.removeProperty('transform');
-      });
-    }
-  };
-
-  // ============================================================
-  // Exporters
-  // ============================================================
-  const exporters = {
-    html: async () => {
-      const blob = new Blob([currentHtml], { type: 'text/html;charset=utf-8' });
-      downloadBlob(blob, baseFilename() + '.html');
-      setStatus('HTML saved');
-    },
-
-    png: async () => {
-      setStatus('exporting PNG...');
-      const { canvases, mode } = await captureSlides();
-      // 単一 → 1枚のPNG、複数 → ZIPアーカイブ
-      if (canvases.length === 1) {
-        const blob = await canvasToBlob(canvases[0], 'image/png');
-        downloadBlob(blob, baseFilename() + '.png');
-        setStatus('PNG saved (' + formatBytes(blob.size) + ', mode=' + mode + ')');
-        return;
-      }
-      await loadScript(URLS.jszip);
-      const zip = new window.JSZip();
-      const padLen = String(canvases.length).length;
-      for (let i = 0; i < canvases.length; i++) {
-        showProgress(i + 1, canvases.length);
-        setStatus('packing PNG ' + (i + 1) + '/' + canvases.length + '...');
-        const blob = await canvasToBlob(canvases[i], 'image/png');
-        const idx = String(i + 1).padStart(padLen, '0');
-        zip.file(baseFilename() + '-' + idx + '.png', blob);
-      }
-      const zipBlob = await zip.generateAsync({ type: 'blob' });
-      downloadBlob(zipBlob, baseFilename() + '-png.zip');
-      setStatus('PNG ZIP saved (' + canvases.length + ' images, ' + formatBytes(zipBlob.size) + ', mode=' + mode + ')');
-    },
-
-    pdf: async () => {
-      setStatus('exporting PDF...');
-      await loadScript(URLS.jspdf);
-      const { canvases, mode } = await captureSlides();
-      const { jsPDF } = window.jspdf;
-
-      // 単一モード（通常のアーティファクト）
-      // → 縦横比からA4の向きを決め、長辺方向にページ自動分割
-      if (mode === 'single' && canvases.length === 1) {
-        const c = canvases[0];
-        const orient = c.width >= c.height ? 'landscape' : 'portrait';
-        const pdf = new jsPDF({ orientation: orient, unit: 'pt', format: 'a4', compress: true });
-        const pw = pdf.internal.pageSize.getWidth();
-        const ph = pdf.internal.pageSize.getHeight();
-        const isPortrait = orient === 'portrait';
-        // 短辺をページに合わせる縮尺
-        const scale = isPortrait ? pw / c.width : ph / c.height;
-        const longCanvas = isPortrait ? c.height : c.width;     // 元キャンバスの長辺ピクセル
-        const longPage = isPortrait ? ph : pw;                  // PDFページの長辺pt
-        const longScaled = longCanvas * scale;                  // 長辺を縮尺後
-
-        if (longScaled <= longPage + 0.5) {
-          // 1ページに収まる → レターボックス
-          const r = Math.min(pw / c.width, ph / c.height);
-          const w = c.width * r;
-          const h = c.height * r;
-          pdf.addImage(c.toDataURL('image/png'), 'PNG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
-          pdf.save(baseFilename() + '.pdf');
-          setStatus('PDF saved (1 page, mode=single)');
-        } else {
-          // 長辺方向にページ分割
-          const pageInCanvas = longPage / scale;
-          const pageCount = Math.ceil(longCanvas / pageInCanvas);
-          const slicer = document.createElement('canvas');
-          if (isPortrait) slicer.width = c.width; else slicer.height = c.height;
-          const sctx = slicer.getContext('2d');
-          for (let i = 0; i < pageCount; i++) {
-            const start = i * pageInCanvas;
-            const sliceLen = Math.min(pageInCanvas, longCanvas - start);
-            if (isPortrait) slicer.height = Math.ceil(sliceLen);
-            else slicer.width = Math.ceil(sliceLen);
-            sctx.fillStyle = '#ffffff';
-            sctx.fillRect(0, 0, slicer.width, slicer.height);
-            if (isPortrait) {
-              sctx.drawImage(c, 0, start, c.width, sliceLen, 0, 0, c.width, sliceLen);
-            } else {
-              sctx.drawImage(c, start, 0, sliceLen, c.height, 0, 0, sliceLen, c.height);
-            }
-            if (i > 0) pdf.addPage('a4', orient);
-            if (isPortrait) {
-              pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, pw, sliceLen * scale, undefined, 'FAST');
-            } else {
-              pdf.addImage(slicer.toDataURL('image/png'), 'PNG', 0, 0, sliceLen * scale, ph, undefined, 'FAST');
-            }
-            showProgress(i + 1, pageCount);
-            setStatus('rendering PDF page ' + (i + 1) + '/' + pageCount + '...');
-          }
-          pdf.save(baseFilename() + '.pdf');
-          setStatus('PDF saved (' + pageCount + ' pages, mode=long-page-' + (isPortrait ? 'v' : 'h') + ')');
-        }
-        return;
-      }
-
-      // 複数スライド：1スライド = 1ページ（向きはキャンバス比で個別判定）
-      const first = canvases[0];
-      const firstOrient = first.width >= first.height ? 'landscape' : 'portrait';
-      const pdf = new jsPDF({ orientation: firstOrient, unit: 'pt', format: 'a4', compress: true });
-      for (let i = 0; i < canvases.length; i++) {
-        const c = canvases[i];
-        const orient = c.width >= c.height ? 'landscape' : 'portrait';
-        if (i > 0) pdf.addPage('a4', orient);
-        const pw = pdf.internal.pageSize.getWidth();
-        const ph = pdf.internal.pageSize.getHeight();
-        const r = Math.min(pw / c.width, ph / c.height);
-        const w = c.width * r;
-        const h = c.height * r;
-        pdf.addImage(c.toDataURL('image/png'), 'PNG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
-        showProgress(i + 1, canvases.length);
-        setStatus('rendering PDF page ' + (i + 1) + '/' + canvases.length + '...');
-      }
-      pdf.save(baseFilename() + '.pdf');
-      setStatus('PDF saved (' + canvases.length + ' page' + (canvases.length === 1 ? '' : 's') + ', mode=' + mode + ')');
-    },
-
-    pptx: async () => {
-      setStatus('exporting PPTX...');
-      await loadScript(URLS.pptxgen);
-      await waitForFrame();
-      const doc = frame.contentDocument;
-      const win = frame.contentWindow;
-      if (!doc || !doc.documentElement) {
-        throw new Error('iframe document is unavailable (sandbox may be too strict)');
-      }
-      const PptxGenJS = window.PptxGenJS;
-      const pptx = new PptxGenJS();
-      pptx.layout = 'LAYOUT_WIDE'; // 13.333 x 7.5 inches (16:9)
-
-      // 編集可能パスの判定: reveal.jsでなく、複数の<section>がbody直下/.marpit直下/main直下にあるか
-      // win が null/undefined のケース（iframe が同期的に破棄された・クロスオリジン遷移等）
-      // を防ぐため win 自身の null チェックを加える。
-      const hasReveal = win && win.Reveal && typeof win.Reveal.slide === 'function';
-      let editableSections = null;
-      if (!hasReveal) {
-        for (const sel of ['body > section', '.marpit > section', 'main > section']) {
-          const found = Array.from(doc.querySelectorAll(sel));
-          if (found.length >= 2) { editableSections = found; break; }
-        }
-      }
-
-      if (editableSections) {
-        // Marpit構造 → ネイティブ要素ベースの編集可能PPTX
-        setStatus('building editable PPTX (' + editableSections.length + ' slides)...');
-        await buildEditablePptx(pptx, editableSections, doc, win);
-        const ttl = extractTitle(currentHtml);
-        if (ttl) pptx.title = ttl;
-        await pptx.writeFile({ fileName: baseFilename() + '.pptx' });
-        setStatus('PPTX saved (' + editableSections.length + ' slides, mode=editable)');
-        return;
-      }
-
-      // フォールバック: 画像貼り付け（reveal.js / hr区切り / 自由構造）
-      const { canvases, mode } = await captureSlides();
-      const slideW = 13.333, slideH = 7.5;
-      const slideRatio = slideW / slideH;
-      for (const canvas of canvases) {
-        const imgRatio = canvas.width / canvas.height;
-        let w, h;
-        if (imgRatio > slideRatio) { w = slideW; h = slideW / imgRatio; }
-        else { h = slideH; w = slideH * imgRatio; }
-        const s = pptx.addSlide();
-        s.addImage({
-          data: canvas.toDataURL('image/png'),
-          x: (slideW - w) / 2,
-          y: (slideH - h) / 2,
-          w, h
-        });
-      }
-      const ttl = extractTitle(currentHtml);
-      if (ttl) pptx.title = ttl;
-      await pptx.writeFile({ fileName: baseFilename() + '.pptx' });
-      setStatus('PPTX saved (' + canvases.length + ' slide' + (canvases.length === 1 ? '' : 's') + ', mode=image-' + mode + ')');
-    }
-  };
-
-  // ============================================================
   // Copy URL / Copy Short URL
   // ============================================================
-  /**
-   * Copy URL ボタン。圧縮URL（`#b=...` / `#z=...`）で開いている場合は、
-   * 展開後の生HTMLを # 以降にそのまま埋めた「非圧縮の元URL」を組み立ててコピーする。
-   * 生HTMLでそのまま開いている場合は location.href をそのままコピーする（従来挙動）。
-   */
   const copyUrl = async () => {
     try {
-      let url = location.href;
-      const raw = location.hash.slice(1);
-      const isCompressed = SHORT_URL_HASH_RE.test(raw);
-      if (isCompressed && currentHtml) {
-        // AGENTS のルールに従い、HTML 中の `#` のみ %23 にエスケープする。
-        // その他の特殊文字（< > " 等）はブラウザがアドレスバー表示上で自動エンコードし、
-        // ビューア側は decodeHashHtml で復元するため、生HTML のまま埋めて良い。
-        url = location.origin + location.pathname + '#' + currentHtml.replace(/#/g, '%23');
-      }
-      await navigator.clipboard.writeText(url);
-      const original = copyBtn.textContent;
-      copyBtn.textContent = 'Copied';
-      setTimeout(() => { copyBtn.textContent = original; }, 1500);
+      await navigator.clipboard.writeText(location.href);
+      setStatus('URL copied');
     } catch (e) {
-      setStatus('copy failed: ' + (e && e.message ? e.message : e));
+      setStatus('clipboard failed: ' + (e && e.message ? e.message : e));
     }
   };
 
-  /**
-   * 現在のアーティファクトを A-1 ミニファイ + ±A-3 静的辞書 + ±カスタム辞書プレフィックス(v1〜) で前処理した上で、
-   * 全圧縮形式（zstd / brotli / brotli-wasm(q11) / deflate-raw / gzip / LZMA）を並列に試行し、
-   * 最短ペイロードを採用した短縮URLをクリップボードにコピーする。
-   * プレフィックス形式: [<digit>]<letter>
-   *   小文字 (b/z/d/s/l) = A-3 なし、大文字 = A-3 あり
-   *   数字プレフィックス (1b, 1B 等) = カスタム辞書 v1〜 適用
-   * 外部サービスへの送信は一切行わない（CompressionStream API + brotli-wasm + LZMA-JS のみ）。
-   * 圧縮率は内容に依存するが、典型的には元の 10〜30%（前処理 + カスタム辞書 + 最良形式）。
-   */
   const copyShortUrl = async () => {
-    if (!currentHtml) {
-      setStatus('No artifact to compress');
-      return;
-    }
-    // 圧縮処理中に hashchange でアーティファクトが切り替わると、クリップボードに入る
-    // URL は「クリック時に見ていたコンテンツ」だが、ステータス表示は「現在のコンテンツ」を
-    // 分母にしてスケールが狂うので、圧縮入力をローカルに固定し、完了時に整合性を検査
-    // して食い違いを検出したらクリップボードへの書き込みを中止する。
-    const sourceHtml = currentHtml;
+    if (!currentHtml) return;
     setBusy(true);
     setStatus('compressing...');
     try {
-      const { format, prefix, dict, customDictVersion, payload } = await compressHtml(sourceHtml);
-      if (sourceHtml !== currentHtml) {
-        setStatus('artifact changed during compression — please retry');
-        return;
-      }
-      const shortUrl = location.origin + location.pathname + '#' + prefix + '=' + payload;
-      // 圧縮率の分母は「現在の URL 長」ではなく「ソース HTML をそのまま埋めた
-      // 標準形 URL 長」とする。これにより、すでに圧縮 URL で開いている状態でも
-      // 「本来の元 URL に対して何 % に縮んだか」が一貫して表示される。
-      const baselineUrl = location.origin + location.pathname + '#' + sourceHtml.replace(/#/g, '%23');
-      const baselineLen = baselineUrl.length;
-      const newLen = shortUrl.length;
-      const ratio = baselineLen > 0 ? Math.round((newLen / baselineLen) * 100) : 0;
-      await navigator.clipboard.writeText(shortUrl);
-      const original = shortenBtn.textContent;
-      shortenBtn.textContent = 'Copied';
-      setTimeout(() => { shortenBtn.textContent = original; }, 1500);
-      const ctags = [format];
-      if (dict) ctags.push('A3');
-      if (customDictVersion === 6) ctags.push('dyn-v6');
-      else if (customDictVersion === 7) ctags.push('sdht-v7');
-      else if (customDictVersion > 0) ctags.push('dict-v' + customDictVersion);
-      const tag = ctags.join('+');
-      setStatus('Short URL copied (' + tag + ', ' + formatBytes(baselineLen) + ' → ' + formatBytes(newLen) + ', ' + ratio + '%)');
+      const result = await compressHtml(currentHtml);
+      const hash = '#' + result.prefix + '=' + result.payload;
+      const url = location.origin + location.pathname + hash;
+      await navigator.clipboard.writeText(url);
+      const tags = [result.format];
+      if (result.dict) tags.push('A3');
+      if (result.customDictVersion === 6) tags.push('dyn-v6');
+      else if (result.customDictVersion === 7) tags.push('sdht-v7');
+      else if (result.customDictVersion > 0) tags.push('dict-v' + result.customDictVersion);
+      setStatus('short URL copied (' + tags.join('+') + ', ' + url.length + ' chars)');
     } catch (e) {
       setStatus('shorten failed: ' + (e && e.message ? e.message : e));
     } finally {
@@ -2036,43 +588,19 @@
   };
 
   // ============================================================
-  // Events
+  // Event wiring & init
   // ============================================================
-  // iframe srcdoc が再読込みされるたびに新しい contentDocument に対して anchor interceptor を再装着する
-  // 永続的な単一リスナー。render() の連続呼び出しで once リスナーが多重登録され、同一 doc に
-  // interceptor が複数効いて 1 クリックで N 回 scrollIntoView してしまう事故を防ぐため、
-  // once ではなく永続として 1 個だけ貼る。
   frame.addEventListener('load', () => attachAnchorInterceptor());
 
-  // hashchange は通常 render を呼ぶが、iframe 内アンカーリンクが何らかの経路で親 URL を
-  // 書き換えてしまった場合 (<base target="_top"> 付き AI 生成 HTML、parent.location.hash の
-  // 直書き等) に、その短い hash を新しい HTML として解釈し直して画面が壊れる事故を防ぐため、
-  // iframe 内に該当 id を持つ要素が実在する短い hash は再描画せず URL を元に戻して
-  // iframe 内スクロールに振り替える。実在 id 判定を伴うので、別アーティファクトをハッシュで
-  // 開く通常用途は妨げない。
   window.addEventListener('hashchange', () => {
     const newHash = location.hash.slice(1);
     if (newHash === lastContentHash) return;
     if (isAnchorLikeHash(newHash)) {
-      try {
-        const restored = location.pathname + location.search + (lastContentHash ? '#' + lastContentHash : '');
-        history.replaceState(null, '', restored);
-      } catch (e) { /* ignore */ }
-      const idoc = frame.contentDocument;
-      if (idoc) {
-        try {
-          const id = decodeURIComponent(newHash);
-          const target = idoc.getElementById(id);
-          if (target && typeof target.scrollIntoView === 'function') {
-            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          }
-        } catch (e) { /* ignore */ }
-      }
+      // アンカークリックの副作用と判定 → URL を戻して再描画はしない
+      try { history.replaceState(null, '', '#' + lastContentHash); } catch (e) {}
       return;
     }
-    // render が何らかの理由で reject した場合 (srcdoc 設定失敗、デコード中の予期しない
-    // 例外など) に unhandled rejection を出さず、ステータスにエラーを表示してユーザーに伝える。
-    render().catch(e => setStatus('render failed: ' + (e && e.message ? e.message : e)));
+    render();
   });
 
   exportBtns.forEach(btn => {
@@ -2083,7 +611,7 @@
       try {
         await exporters[fmt]();
       } catch (e) {
-        setStatus(fmt.toUpperCase() + ' export failed: ' + (e && e.message ? e.message : e));
+        setStatus('export failed: ' + (e && e.message ? e.message : e));
       } finally {
         setBusy(false);
       }
@@ -2093,12 +621,10 @@
   copyBtn.addEventListener('click', copyUrl);
   shortenBtn.addEventListener('click', copyShortUrl);
 
-  // === Initial render ===
-  // 初期 render の unhandled rejection もステータスに表示してサイレント失敗を防ぐ。
+  // 初回描画。エラーは status に表示。
   render().catch(e => setStatus('init failed: ' + (e && e.message ? e.message : e)));
 
-  // LZMA-JS ・ brotli-wasm をバックグラウンドで先読みしておく（初回 Copy Short URL クリック時の待ち時間を削減）。
-  // 失敗してもサイレントに無視する（各圧縮関数内で必要時に再試行されるため）。
+  // CDN 系のプリロード（失敗は無視）
   loadScript(URLS.lzma).catch(() => {});
   loadBrotliWasm().catch(() => {});
 })();
