@@ -192,7 +192,13 @@
       if (tag === 'A') {
         // SVGの<a>は node.href が SVGAnimatedString になるため getAttribute を使う
         const href = node.getAttribute && node.getAttribute('href');
-        if (href) {
+        // フラグメントのみリンク (`#section`) は PPTX 上で意味を持たない (PowerPoint には
+        // 該当 ID を持つ要素がないため、クリックしても「このリンクを開けません」という
+        // エラーが出るだけ)。href の相対解決 (node.href) を経由すると `https://host/path/#section`
+        // のような絶対 URL になってしまい、PowerPoint がそれを外部リンクとして開こうとして
+        // しまうため、生 href の段階で `#` 始まりを弾く。href が空のリンクも同様に hyperlink を
+        // 設定しない (テキスト自体は親 ctx で出力される)。
+        if (href && href.charAt(0) !== '#') {
           const url = (typeof node.href === 'string' && node.href) || href;
           // PowerPointで開いた際の安全性のため javascript: / data: / vbscript: スキームは除外
           if (!/^\s*(javascript|data|vbscript):/i.test(url)) {
@@ -270,6 +276,30 @@
         const win = frame.contentWindow;
         if (!doc || !doc.documentElement) {
           throw new Error('iframe document is unavailable (sandbox may be too strict)');
+        }
+
+        // 画像のロード完了を最大 3 秒待つ。html2canvas は描画時に img.complete を見て
+        // 待機するが、`<img loading="lazy">` で viewport 外に置かれた画像は fetch 自体が
+        // 開始されておらず、html2canvas の内部待機ループでも永遠に読み込まれないまま
+        // タイムアウトする (結果として PNG/PDF/画像 PPTX に画像が抜け落ちる)。AI 生成の
+        // モダン HTML では Tailwind 等で loading="lazy" が既定化されているケースが多く
+        // 影響が広い。loading 属性を eager に一時昇格してから addEventListener('load')
+        // で待つことで、lazy 画像も確実にロードしてから html2canvas に渡す。
+        // タイムアウト 3 秒は buildEditablePptx 側と揃える。エラー画像 (404/CORS) でも
+        // finish を呼ぶため、壊れた画像があっても全体ハングは起きない。
+        const allImgs = Array.from(doc.querySelectorAll('img'));
+        if (allImgs.length > 0) {
+          await Promise.all(allImgs.map(img => {
+            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+            return new Promise(res => {
+              let done = false;
+              const finish = () => { if (!done) { done = true; res(); } };
+              img.addEventListener('load', finish, { once: true });
+              img.addEventListener('error', finish, { once: true });
+              try { if (img.loading === 'lazy') img.loading = 'eager'; } catch (e) { /* ignore */ }
+              setTimeout(finish, 3000);
+            });
+          }));
         }
 
         // ---- reveal.js path ----
@@ -563,7 +593,9 @@
                   const parentA = el.closest && el.closest('a[href]');
                   if (parentA) {
                     const href = parentA.getAttribute('href');
-                    if (href && !/^\s*(javascript|data|vbscript):/i.test(href)) {
+                    // 上の <a> 処理と同じく、フラグメントのみリンクは PPTX で意味がないので
+                    // hyperlink を設定しない (PowerPoint で「リンクを開けません」エラーになる)。
+                    if (href && href.charAt(0) !== '#' && !/^\s*(javascript|data|vbscript):/i.test(href)) {
                       const url = (typeof parentA.href === 'string' && parentA.href) || href;
                       opts.hyperlink = { url };
                     }

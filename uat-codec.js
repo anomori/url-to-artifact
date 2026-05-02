@@ -259,6 +259,19 @@
       });
       return '<' + tag + indexed.map(({ a }) => ' ' + a.name + (a.value !== undefined ? '=' + a.value : '')).join('') + slash + '>';
     });
+    // 自己終了タグ × 引用符なし属性値の致命的バグ修正。
+    //   HTML5 仕様 13.2.5.36「Attribute value (unquoted) state」では `/` は値の区切りでは
+    //   なく "Anything else" 分岐 (= 値の一部) として扱われる。つまり上の引用符除去ステップを
+    //   経由した結果生まれる `<circle r=40/>` は HTML5 パーサで `r="40/"` と解釈され、SVG 属性
+    //   としては不正値になる。これにより `<circle>` `<rect>` `<line>` `<ellipse>` `<animate>`
+    //   `<animateTransform>` `<stop>` 等の数値主体な自己終了 SVG 要素が軒並み描画不能になり、
+    //   Copy Short URL 経由 (= minify 必須経路) でだけ図形 / グラフ / アニメーションが
+    //   表示されない症状が出ていた。 (生 HTML 直貼り経路は minify を通らないため再現せず。)
+    //   `=value/>` パターンに限定して `/` の直前に空白を 1 文字差し込み、unquoted 値を確実に
+    //   終端させる。`<br/>` `<hr/>` 等の属性なし自己終了タグには `=value` 必須条件のため影響なし。
+    //   character class は属性値として許容される文字 (元の attribute sort regex と同等) から
+    //   さらに `/` を除外し、最初の `/>` 直前で確実に区切る。
+    work = work.replace(/(=[^\s"'`=<>\/]+)\/>/g, '$1 />');
     // マーカー復元
     const restoreRe = new RegExp(marker + '(\\d+)X', 'g');
     work = work.replace(restoreRe, (_, idx) => preserved[parseInt(idx, 10)] || '');
@@ -594,8 +607,17 @@
       }
     }
     // 圧縮器リスト: CompressionStream 系 + LZMA + brotli-wasm(q11)
+    // 圧縮可・展開可の両方を満たす形式のみを採用する。Compression Streams API は仕様上
+    // CompressionStream と DecompressionStream を独立に実装でき、ブラウザの過渡期実装では
+    // 「圧縮は対応済みだが展開はまだ」という非対称な状態が一時的に生じうる (zstd の対応
+    // ロールアウト履歴を見れば過去にも実例あり)。圧縮側だけで filter すると、「自分の
+    // ブラウザで圧縮成功 → 短縮 URL 完成 → 開き直すと展開できない」事故が起きる。
+    // brotli は brotli-wasm によるソフトウェア展開フォールバック (decompressBrotliWasm) が
+    // あるため、ネイティブ DecompressionStream 非対応でも安全に展開できる。
     const compressors = [
-      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) => compressSupport[format]).map(f => ({
+      ...SHORT_URL_FORMATS_NATIVE.filter(({ format }) =>
+        compressSupport[format] && (decompressSupport[format] || format === 'brotli')
+      ).map(f => ({
         pfx: f.prefix, fmt: f.format, fn: (t) => compressWithStream(t, f.format)
       })),
       { pfx: 'l', fmt: 'lzma', fn: (t) => compressLzma(t) },
