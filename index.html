@@ -579,7 +579,18 @@
       if (result.customDictVersion === 6) tags.push('dyn-v6');
       else if (result.customDictVersion === 7) tags.push('sdht-v7');
       else if (result.customDictVersion > 0) tags.push('dict-v' + result.customDictVersion);
-      setStatus('short URL copied (' + tags.join('+') + ', ' + url.length + ' chars)');
+      // 圧縮効果の可視化: 元 HTML のバイトサイズ、短縮 URL のバイトサイズ、
+      // そして「パーセンテージ何%圧縮されたか」を status に表示する。
+      // currentHtml.length は UTF-16 code unit 数なので多バイト文字では実際のバイト数と
+      // ずれる。Blob でサイズを取ると UTF-8 エンコード後のバイト数が取れるので、
+      // ユーザーが「ファイルの大きさ」として認識している数値と一致しやすい。
+      const beforeBytes = new Blob([currentHtml]).size;
+      const afterBytes = new Blob([url]).size;
+      const savedPct = beforeBytes > 0 ? ((1 - afterBytes / beforeBytes) * 100) : 0;
+      const sign = savedPct >= 0 ? '-' : '+';
+      setStatus('short URL copied (' + tags.join('+') + ', '
+        + formatBytes(beforeBytes) + ' → ' + formatBytes(afterBytes)
+        + ', ' + sign + Math.abs(savedPct).toFixed(1) + '%)');
     } catch (e) {
       setStatus('shorten failed: ' + (e && e.message ? e.message : e));
     } finally {
