@@ -482,6 +482,11 @@
     //   大文字 (v2, 辞書あり): S/B/D/Z/L  ← 展開後に A-3 辞書を逆処理する
     const compressedMatch = raw.match(SHORT_URL_HASH_RE);
     if (compressedMatch) {
+      // デコード処理が始まる前に busy 状態にし、古いアーティファクトのエクスポートボタンを
+      // 無効化する。これをしないと、前のアーティファクトが表示されている状態でURLを変更した際、
+      // デコード中も Export / Copy Short URL ボタンが有効なままになり、古いコンテンツを
+      // 誤ってエクスポートできてしまう。
+      setBusy(true);
       const customDictVersion = compressedMatch[1] ? parseInt(compressedMatch[1], 10) : 0;
       const prefixChar = compressedMatch[2];
       const fmt = FORMAT_BY_PREFIX[prefixChar];

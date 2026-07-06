@@ -154,7 +154,16 @@
       // バックスラッシュエスケープ (\" \') を含む文字列にも対応。
       const cssStrings = [];
       const cssMarker = 'UATCSS' + Math.random().toString(36).slice(2, 10) + 'X';
-      let s = css.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => {
+      // url() をクォートの有無に関わらず先に退避する。
+      // 引用符なし url(image-0.5.png) は後続の string regex に引っかからないため、
+      // 0.5→.5 や 0px→0 等の数値変換でパス名・data URL が破壊されるのを防ぐ。
+      // url("...") / url('...') 形式は次の string regex と重複退避になるが無害。
+      let s = css.replace(/url\((?:"[^"]*"|'[^']*'|[^)]*)\)/gi, (m) => {
+        const t = cssMarker + cssStrings.length + 'X';
+        cssStrings.push(m);
+        return t;
+      });
+      s = s.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => {
         const t = cssMarker + cssStrings.length + 'X';
         cssStrings.push(m);
         return t;

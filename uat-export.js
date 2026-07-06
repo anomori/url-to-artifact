@@ -289,6 +289,7 @@
         // finish を呼ぶため、壊れた画像があっても全体ハングは起きない。
         const allImgs = Array.from(doc.querySelectorAll('img'));
         if (allImgs.length > 0) {
+          const lazyToRestore = [];
           await Promise.all(allImgs.map(img => {
             if (img.complete && img.naturalWidth > 0) return Promise.resolve();
             return new Promise(res => {
@@ -296,10 +297,12 @@
               const finish = () => { if (!done) { done = true; res(); } };
               img.addEventListener('load', finish, { once: true });
               img.addEventListener('error', finish, { once: true });
-              try { if (img.loading === 'lazy') img.loading = 'eager'; } catch (e) { /* ignore */ }
+              try { if (img.loading === 'lazy') { img.loading = 'eager'; lazyToRestore.push(img); } } catch (e) { /* ignore */ }
               setTimeout(finish, 3000);
             });
           }));
+          // エクスポート後もアーティファクト内で lazy loading が正常に機能するよう属性を元に戻す
+          lazyToRestore.forEach(img => { try { img.loading = 'lazy'; } catch (e) { /* ignore */ } });
         }
 
         // ---- reveal.js path ----
@@ -453,6 +456,8 @@
               const finish = () => { if (!done) { done = true; res(); } };
               img.addEventListener('load', finish, { once: true });
               img.addEventListener('error', finish, { once: true });
+              // captureSlides 同様、lazy 画像もロードされるよう eager に昇格させる
+              try { if (img.loading === 'lazy') img.loading = 'eager'; } catch (e) { /* ignore */ }
               setTimeout(finish, 3000);
             });
           }));
@@ -782,6 +787,7 @@
               const slicer = document.createElement('canvas');
               if (isPortrait) slicer.width = c.width; else slicer.height = c.height;
               const sctx = slicer.getContext('2d');
+              if (!sctx) throw new Error('Failed to get 2D context for PDF page slicing');
               for (let i = 0; i < pageCount; i++) {
                 const start = i * pageInCanvas;
                 const sliceLen = Math.min(pageInCanvas, longCanvas - start);
